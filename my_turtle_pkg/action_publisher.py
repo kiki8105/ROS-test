@@ -1,7 +1,11 @@
 import rclpy  # 모듈 전체를 가져옴. 이후 rclpy.init()처럼 사용
 from rclpy.node import Node  # 모듈에서 Node 클래스만 가져옴
 from geometry_msgs.msg import Twist  # 선속도·각속도를 담는 메시지 클래스
+import math
+import time
 
+from sensor_msgs.msg import LaserScan
+from rclpy.qos import qos_profile_sensor_data
 
 # class 클래스명(부모클래스): → 부모의 기능을 상속받는 클래스 정의
 class ActionPublisher(Node):
@@ -13,9 +17,16 @@ class ActionPublisher(Node):
         # 부모인 Node를 초기화하고 ROS 노드 이름을 지정
         super().__init__('action_publisher')
 
-        # 문자열은 따옴표로 표현
-        # 'action'이라는 ROS 파라미터를 선언하고 기본값을 'stop'으로 지정
-        self.declare_parameter('action', 'stop')
+        # self에 저장한 값은 다른 메서드에서도 읽고 변경할 수 있음
+        self.action = 'stop'
+        self.last_scan_time = None
+
+        self.subscription = self.create_subscription(
+            LaserScan,                # 받을 메시지 타입
+            '/scan_mock',             # 구독할 토픽
+            self.scan_callback,       # 메시지를 받을 때 실행할 함수
+            qos_profile_sensor_data,  # 센서 데이터용 QoS
+        )
 
         # self.publisher: 객체에 저장하는 속성으로, 다른 메서드에서도 사용 가능
         # 괄호 안에서는 여러 줄에 걸쳐 인자를 작성할 수 있음
@@ -35,8 +46,19 @@ class ActionPublisher(Node):
         # get_parameter()는 파라미터 객체를 반환
         # .value로 실제 값('stop', 'forward' 등)을 가져옴
         # action은 이 메서드 안에서 사용하는 지역 변수
-        action = self.get_parameter('action').value
+        # action = self.get_parameter('action').value
 
+        # 아직 센서를 못 받았거나 마지막 수신 후 n초가 지나면 정지
+        if (
+            self.last_scan_time is None
+            or time.monotonic() - self.last_scan_time > 5.0
+        ):
+            action = 'stop'
+
+        else:
+            action = self.action  # self.action을 지역 변수 action에 복사
+
+        
         # 클래스명() → 해당 클래스의 새 객체 생성
         # Twist의 선속도·각속도 성분은 기본적으로 모두 0.0
         command = Twist()
@@ -75,6 +97,56 @@ class ActionPublisher(Node):
             # 이름=값: 함수 호출에서 사용하는 키워드 인자
             # 로그 출력 간격을 최소 1초로 제한. 발행 주기는 여전히 0.1초
             throttle_duration_sec=1.0,
+        )
+
+    def sector_min(self, scan, center_deg):
+        """지정한 방향의 좌우 10도 범위에서 가장 가까운 거리 반환."""
+        distances = []
+
+        # enumerate(): 배열의 인덱스와 값을 함께 꺼냄
+        for index, distance in enumerate(scan.ranges):
+            angle = scan.angle_min + index * scan.angle_increment
+
+            # 기준 방향과의 차이를 -π~π 범위로 변환
+            # 덕분에 전방 0도 주변의 359도도 함께 검사됨
+            difference = angle - math.radians(center_deg)
+            difference = math.atan2(
+                math.sin(difference),
+                math.cos(difference),
+            )
+
+            if abs(difference) <= math.radians(10):
+                if (
+                    math.isfinite(distance)
+                    and scan.range_min <= distance <= scan.range_max
+                ):
+                    distances.append(distance)
+
+        # 유효한 측정값이 없으면 여유 공간으로 판단하지 않음
+        return min(distances) if distances else 0.0
+    
+    def scan_callback(self, scan):
+        front = self.sector_min(scan, 0)
+        left = self.sector_min(scan, 90)
+        right = self.sector_min(scan, -90)
+
+        threshold = 0.6
+
+        if front > threshold:
+            self.action = 'forward'
+        elif left <= threshold and right <= threshold:
+            self.action = 'stop'
+        elif left >= right:
+            self.action = 'left'
+        else:
+            self.action = 'right'
+
+        # 시스템 시각 변경의 영향을 받지 않는 경과 시간 측정용 시계
+        self.last_scan_time = time.monotonic()
+
+        self.get_logger().info(
+            f'전방={front:.2f}, 좌측={left:.2f}, '
+            f'우측={right:.2f} → {self.action}'
         )
 
 
