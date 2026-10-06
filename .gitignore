@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+build/
+install/
+log/
+my_turtle_pkg/lds02_dataset/
+my_turtle_pkg/lds02_mock.json
