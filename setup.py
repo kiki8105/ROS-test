@@ -18,5 +18,6 @@ setup(
         'circle_turtle = my_turtle_pkg.circle_turtle:main',
         'scan_drive = my_turtle_pkg.scan_drive:main',
         'lidar_mock = my_turtle_pkg.lidar_mock:main',
+        'action_publisher = my_turtle_pkg.action_publisher:main',
     ]},
 )
