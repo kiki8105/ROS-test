@@ -51,7 +51,7 @@ class ActionPublisher(Node):
         # 아직 센서를 못 받았거나 마지막 수신 후 n초가 지나면 정지
         if (
             self.last_scan_time is None
-            or time.monotonic() - self.last_scan_time > 5.0
+            or time.monotonic() - self.last_scan_time > 0.1
         ):
             action = 'stop'
 
