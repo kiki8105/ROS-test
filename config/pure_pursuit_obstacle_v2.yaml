@@ -1,0 +1,67 @@
+pure_pursuit_obstacle_v2:
+  ros__parameters:
+    use_sim_time: true
+
+    # 출발 잠금: Initial Pose, 목표, /plan을 확인한 뒤 true로 변경합니다.
+    drive_enabled: false
+
+    # Pure Pursuit 속도와 곡선 추종
+    linear_velocity: 0.08             # 정상 선속도 [m/s]
+    lookahead_distance: 0.40          # 전방 주시 거리 [m], 크면 완만해짐
+    goal_tolerance: 0.20              # 최종 목표 도착 반경 [m]
+    path_point_tolerance: 0.12        # A* 중간 경로점 통과 반경 [m]
+    max_angular_velocity: 0.60        # 각속도 절대 상한 [rad/s]
+    linear_acceleration_limit: 0.15   # 선형 가속·감속 한계 [m/s²]
+    angular_acceleration_limit: 0.80  # 각가속·감속 한계 [rad/s²]
+    heading_rotate_enter: 1.05        # 제자리 방향 정렬 진입 오차 [rad]
+    heading_rotate_exit: 0.70         # 제자리 방향 정렬 종료 오차 [rad]
+    heading_gain: 1.00                # 제자리 정렬 비례 게인
+
+    # A* 전역 경로 계획
+    occupied_threshold: 50            # 점유값이 이 값 이상이면 장애물
+    unknown_is_blocked: true          # 미탐색(-1) 셀 통과 금지
+    inflation_radius: 0.20            # Waffle Pi 외접 반경보다 큰 팽창 [m]
+    nearest_free_radius: 0.30         # 막힌 시작/목표 주변 검색 반경 [m]
+    allow_diagonal: true              # 8방향 이동, 모서리 관통은 금지
+    max_expansions: 250000            # A* 1회 최대 확장 셀 수
+    replan_distance: 0.45             # TRACK 중 경로 이탈 재계획 거리 [m]
+    replan_cooldown: 1.0              # 연속 재계획 최소 간격 [s]
+
+    # LiDAR 입력과 차체 통로 판정
+    scan_timeout: 0.50                # 새 scan이 없으면 정지하는 시간 [s]
+    pose_timeout: 2.0                 # AMCL과 odom 모두 끊기면 정지 [s]
+    scan_min_hits: 3                  # 단일 광선 잡음을 무시할 최소 검출 수
+    front_corridor_half_width: 0.18   # 전방 검사 통로 반폭 [m]
+    spin_clearance_radius: 0.27       # 제자리 선회에 필요한 중심 반경 [m]
+    obs_threshold: 0.40               # 차체 앞 회피 시작 거리 [m]
+
+    # TURN → BYPASS 장애물 회피
+    avoidance_angular_velocity: 0.23  # 장애물 앞 선회 속도 [rad/s]
+    avoidance_linear_velocity: 0.05   # 장애물 옆 우회 속도 [m/s]
+    avoidance_clear_margin: 0.10      # 회피 해제 거리 추가 여유 [m]
+    avoidance_clear_hold_time: 0.80   # 열린 전방 연속 확인 시간 [s]
+    turn_direction_deadband: 0.05     # 좌우 거리 동률 범위 [m]
+    minimum_turn_angle: 0.35          # BYPASS 전 최소 선회각 [rad]
+    side_clearance: 0.35              # 측면 목표 간격 [m]
+    wall_follow_gain: 0.80            # 측면 거리 보정 게인
+    avoidance_min_duration: 1.0       # 경로 복귀 전 최소 회피 시간 [s]
+    avoidance_max_duration: 15.0      # 초과 시 BLOCKED 정지 [s]
+    avoidance_progress_distance: 0.08 # 경로 복귀에 필요한 최소 진전 [m]
+    rejoin_heading_tolerance: 0.60    # 경로 복귀 방향 오차 [rad]
+
+    # AMCL 절대위치 사이를 /odom 상대이동으로 보간
+    odom_anchor_max_age: 0.20         # AMCL-odom 기준 표본 최대 시간차 [s]
+    odom_reanchor_timeout: 1.0        # odom 중단 뒤 기준 재설정 시간 [s]
+    odom_jump_distance: 0.50          # 한 표본 위치 점프 판정 [m]
+    odom_jump_angle: 1.57             # 한 표본 방향 점프 판정 [rad]
+
+    control_period: 0.10              # 제어 주기 [s], 변경 시 재시작
+
+    # 네임스페이스를 사용할 때도 상대 토픽 이름을 그대로 재사용할 수 있습니다.
+    map_topic: map
+    pose_topic: amcl_pose
+    odom_topic: odom
+    goal_topic: goal_pose
+    scan_topic: scan
+    cmd_vel_topic: cmd_vel
+    path_topic: plan

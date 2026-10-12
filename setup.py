@@ -1,3 +1,4 @@
+from glob import glob
 from setuptools import setup
 
 setup(
@@ -7,6 +8,8 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/my_turtle_pkg']),
         ('share/my_turtle_pkg', ['package.xml']),
+        ('share/my_turtle_pkg/launch', glob('launch/*.launch.py')),
+        ('share/my_turtle_pkg/config', glob('config/*.yaml')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -22,5 +25,6 @@ setup(
         'lidar_db_logger = my_turtle_pkg.lidar_db_logger:main',
         'camera_viewer = my_turtle_pkg.camera_viewer:main',
         'pure_pursuit_obstacle = my_turtle_pkg.pure_pursuit_obstacle:main',
+        'pure_pursuit_obstacle_v2 = my_turtle_pkg.pure_pursuit_obstacle_v2:main',
     ]},
 )
