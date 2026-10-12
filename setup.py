@@ -21,5 +21,6 @@ setup(
         'action_publisher = my_turtle_pkg.action_publisher:main',
         'lidar_db_logger = my_turtle_pkg.lidar_db_logger:main',
         'camera_viewer = my_turtle_pkg.camera_viewer:main',
+        'pure_pursuit_obstacle = my_turtle_pkg.pure_pursuit_obstacle:main',
     ]},
 )
