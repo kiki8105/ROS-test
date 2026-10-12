@@ -1,7 +1,8 @@
 """A* path planning + obstacle-aware Pure Pursuit in one ROS 2 node.
 
 Pipeline:
-    /map + /amcl_pose + /goal_pose -> A* -> /plan -> Pure Pursuit
+    /map + /amcl_pose + code waypoints or /goal_pose
+    -> A* -> /plan -> Pure Pursuit
     /scan -> TRACK / TURN / BYPASS safety controller -> /cmd_vel
 
 The original pure_pursuit_obstacle.py remains unchanged for comparison.
@@ -38,6 +39,43 @@ WorldPoint = tuple[float, float]
 # turtlebot3_waffle_pi.urdf 기준 base_footprint 좌표 [m].
 WAFFLE_PI_LIDAR_X = -0.064
 WAFFLE_PI_FRONT_X = 0.080
+
+# ============================================================================
+# 사용자 코드 WP 입력 구역
+# ----------------------------------------------------------------------------
+# 순서대로 (x, y)를 입력하면 각 WP마다 A* 경로를 새로 계산하고,
+# Pure Pursuit + LiDAR 회피로 이동합니다. 빈 목록이면 /goal_pose 단일 목표만
+# 사용합니다. 좌표를 수정한 뒤 패키지를 다시 빌드하세요.
+#
+# 예시:
+# CODE_MISSION_WAYPOINTS = [
+#     (1.0, 0.5),
+#     (2.0, 1.0),
+#     (0.0, 0.5),
+# ]
+CODE_MISSION_WAYPOINTS = [
+]
+# ============================================================================
+
+
+def validate_mission_waypoints(points):
+    """Return finite (x, y) mission points or raise a clear configuration error."""
+    validated = []
+    for index, point in enumerate(points):
+        if not isinstance(point, (tuple, list)) or len(point) != 2:
+            raise ValueError(
+                f'CODE_MISSION_WAYPOINTS[{index}]는 (x, y) 형식이어야 합니다.')
+        try:
+            x = float(point[0])
+            y = float(point[1])
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f'CODE_MISSION_WAYPOINTS[{index}]의 x, y는 숫자여야 합니다.') from error
+        if not math.isfinite(x) or not math.isfinite(y):
+            raise ValueError(
+                f'CODE_MISSION_WAYPOINTS[{index}]의 x, y는 유한한 값이어야 합니다.')
+        validated.append((x, y))
+    return validated
 
 
 @dataclass(frozen=True)
@@ -687,6 +725,7 @@ class PurePursuitObstacleV2(Node):
 
         self.requested_goal = None
         self.requested_goal_yaw = 0.0
+        self.goal_source = None
         self.active_goal = None
         self.path = []
         self.path_cells = []
@@ -696,6 +735,15 @@ class PurePursuitObstacleV2(Node):
         self.plan_count = 0
         self.last_plan_time = None
         self.replan_requested = False
+
+        # Mission WP index is separate from current_waypoint_index, which is
+        # used for the simplified points inside one A* leg.
+        self.mission_waypoints = validate_mission_waypoints(
+            CODE_MISSION_WAYPOINTS)
+        self.mission_waypoint_index = -1
+        self.mission_active = False
+        self.mission_completed = False
+        self.mission_failed = False
 
         self.latest_scan = None
         self.last_scan_time = None
@@ -768,9 +816,15 @@ class PurePursuitObstacleV2(Node):
         self.get_logger().info(
             'Pure Pursuit Obstacle V2 준비: '
             '/map → A* → /plan → LiDAR 회피 → /cmd_vel')
-        self.get_logger().info(
-            'Initial Pose와 목표를 지정하고 /plan을 확인한 뒤 '
-            'drive_enabled=true로 변경하세요.')
+        if self.mission_waypoints:
+            self.start_code_mission()
+            self.get_logger().info(
+                f'코드 WP 임무 {len(self.mission_waypoints)}개를 로드했습니다. '
+                '/plan을 확인한 뒤 drive_enabled=true로 변경하세요.')
+        else:
+            self.get_logger().info(
+                'CODE_MISSION_WAYPOINTS가 비어 있습니다. Initial Pose와 '
+                '/goal_pose를 지정한 뒤 drive_enabled=true로 변경하세요.')
 
     def _declare_parameters(self):
         """Declare planning, tracking and local-avoidance parameters."""
@@ -1074,7 +1128,14 @@ class PurePursuitObstacleV2(Node):
         self.blocked = blocked
         self.grid_spec = spec
         self.costmap_dirty = False
-        self.planner_state = 'WAIT_GOAL' if self.requested_goal is None else 'PLANNING'
+        if self.mission_failed:
+            self.planner_state = 'MISSION_FAILED'
+        elif self.completed:
+            self.planner_state = (
+                'MISSION_COMPLETED' if self.mission_completed else 'COMPLETED')
+        else:
+            self.planner_state = (
+                'WAIT_GOAL' if self.requested_goal is None else 'PLANNING')
         self.get_logger().info(
             f'지도 수신: {spec.width}x{spec.height}, '
             f'{spec.resolution:.3f}m/cell, frame={spec.frame_id}')
@@ -1231,29 +1292,8 @@ class PurePursuitObstacleV2(Node):
             )
         self.last_pose_time = now
 
-    def goal_callback(self, message):
-        """Stop, discard the old route, and request a new A* route."""
-        map_frame = self.grid_spec.frame_id if self.grid_spec else 'map'
-        if message.header.frame_id and message.header.frame_id != map_frame:
-            self.requested_goal = None
-            self.requested_goal_yaw = 0.0
-            self.clear_path(
-                f'목표 frame={message.header.frame_id} 거부: '
-                f'{map_frame} 좌표가 필요합니다.',
-                state='NO_PATH')
-            return
-        x = float(message.pose.position.x)
-        y = float(message.pose.position.y)
-        if not math.isfinite(x) or not math.isfinite(y):
-            self.requested_goal = None
-            self.requested_goal_yaw = 0.0
-            self.clear_path('목표 좌표가 유한하지 않아 거부합니다.', state='NO_PATH')
-            return
-        try:
-            yaw = quaternion_yaw(message.pose.orientation)
-        except ValueError:
-            yaw = 0.0
-
+    def _reset_route_for_new_goal(self):
+        """Stop and discard state that belongs to the previous A* leg."""
         self.publish_stop()
         self.path = []
         self.path_cells = []
@@ -1265,10 +1305,109 @@ class PurePursuitObstacleV2(Node):
         self.reset_avoidance_state()
         self.publish_path()
 
-        self.requested_goal = (x, y)
-        self.requested_goal_yaw = yaw
+    def _activate_goal(self, x, y, yaw, source):
+        """Install one validated goal and request an A* plan."""
+        self._reset_route_for_new_goal()
+        self.requested_goal = (float(x), float(y))
+        self.requested_goal_yaw = float(yaw)
+        self.goal_source = source
         self.planner_state = 'PLANNING'
         self.replan_requested = True
+
+    def mission_goal_yaw(self, index):
+        """Use the next mission leg direction for Path visualization."""
+        current_x, current_y = self.mission_waypoints[index]
+        if index + 1 < len(self.mission_waypoints):
+            next_x, next_y = self.mission_waypoints[index + 1]
+            return math.atan2(next_y - current_y, next_x - current_x)
+        if index > 0:
+            previous_x, previous_y = self.mission_waypoints[index - 1]
+            return math.atan2(
+                current_y - previous_y, current_x - previous_x)
+        return 0.0
+
+    def _activate_mission_waypoint(self, index):
+        """Select one code-defined mission waypoint as the current goal."""
+        if not 0 <= index < len(self.mission_waypoints):
+            return False
+        self.mission_waypoint_index = index
+        x, y = self.mission_waypoints[index]
+        self._activate_goal(
+            x, y, self.mission_goal_yaw(index), source='MISSION')
+        self.get_logger().info(
+            f'코드 임무 WP {index + 1}/{len(self.mission_waypoints)} 설정: '
+            f'({x:.3f}, {y:.3f})')
+        return True
+
+    def start_code_mission(self):
+        """Start or restart the waypoint list declared at the top of this file."""
+        if not self.mission_waypoints:
+            self.get_logger().warn('실행할 코드 WP가 없습니다.')
+            return False
+        self.mission_active = True
+        self.mission_completed = False
+        self.mission_failed = False
+        return self._activate_mission_waypoint(0)
+
+    def cancel_code_mission(self, reason):
+        """Permanently cancel the code mission when an external goal arrives."""
+        if self.mission_active or self.mission_waypoint_index >= 0:
+            self.get_logger().info(f'코드 WP 임무 취소: {reason}')
+        self.mission_active = False
+        self.mission_completed = False
+        self.mission_failed = False
+        self.mission_waypoint_index = -1
+
+    def _advance_code_mission(self):
+        """Stop at the reached WP and queue the next code-defined goal."""
+        reached = self.mission_waypoint_index
+        self.get_logger().info(
+            f'코드 임무 WP {reached + 1}/{len(self.mission_waypoints)} 도착')
+        next_index = reached + 1
+        if next_index < len(self.mission_waypoints):
+            return self._activate_mission_waypoint(next_index)
+
+        self.mission_active = False
+        self.mission_completed = True
+        self.mission_failed = False
+        self.completed = True
+        self.requested_goal = None
+        self.replan_requested = False
+        self.goal_source = None
+        self.planner_state = 'MISSION_COMPLETED'
+        self.reset_avoidance_state()
+        self.get_logger().info(
+            f'코드 WP 임무 완료: {len(self.mission_waypoints)}/'
+            f'{len(self.mission_waypoints)}, 정지합니다.')
+        return True
+
+    def goal_callback(self, message):
+        """Cancel the code mission and request an external A* goal."""
+        self.cancel_code_mission('외부 /goal_pose 수신')
+        map_frame = self.grid_spec.frame_id if self.grid_spec else 'map'
+        if message.header.frame_id and message.header.frame_id != map_frame:
+            self.requested_goal = None
+            self.requested_goal_yaw = 0.0
+            self.goal_source = None
+            self.clear_path(
+                f'목표 frame={message.header.frame_id} 거부: '
+                f'{map_frame} 좌표가 필요합니다.',
+                state='NO_PATH')
+            return
+        x = float(message.pose.position.x)
+        y = float(message.pose.position.y)
+        if not math.isfinite(x) or not math.isfinite(y):
+            self.requested_goal = None
+            self.requested_goal_yaw = 0.0
+            self.goal_source = None
+            self.clear_path('목표 좌표가 유한하지 않아 거부합니다.', state='NO_PATH')
+            return
+        try:
+            yaw = quaternion_yaw(message.pose.orientation)
+        except ValueError:
+            yaw = 0.0
+
+        self._activate_goal(x, y, yaw, source='EXTERNAL')
         self.get_logger().info(f'새 목표 수신: x={x:.3f}, y={y:.3f}')
 
     def scan_callback(self, message):
@@ -1364,6 +1503,7 @@ class PurePursuitObstacleV2(Node):
 
     def clear_path(self, reason, state='NO_PATH'):
         """Discard stale planning output, reset avoidance, and stop."""
+        mission_failure = self.mission_active and state == 'NO_PATH'
         self.path = []
         self.path_cells = []
         self.current_waypoint_index = 0
@@ -1373,10 +1513,26 @@ class PurePursuitObstacleV2(Node):
         self.heading_align_active = False
         self.replan_requested = False
         self.reset_avoidance_state()
-        self.planner_state = state
+        if mission_failure:
+            self.mission_active = False
+            self.mission_completed = False
+            self.mission_failed = True
+            self.requested_goal = None
+            self.requested_goal_yaw = 0.0
+            self.goal_source = None
+            self.planner_state = 'MISSION_FAILED'
+        else:
+            if not self.mission_active:
+                self.goal_source = None
+            self.planner_state = state
         self.publish_path()
         self.publish_stop()
         self.get_logger().error(reason)
+        if mission_failure:
+            self.get_logger().error(
+                f'코드 WP 임무 중단: '
+                f'{self.mission_waypoint_index + 1}/'
+                f'{len(self.mission_waypoints)} 경로 생성 실패')
 
     def plan_path(self, reason):
         """Plan from the current AMCL pose to the requested goal."""
@@ -1522,9 +1678,14 @@ class PurePursuitObstacleV2(Node):
             self.active_goal[1] - self.current_y,
         )
         if goal_distance <= float(self.get_parameter('goal_tolerance').value):
+            if self.goal_source == 'MISSION' and self.mission_active:
+                return self._advance_code_mission()
             if not self.completed:
                 self.completed = True
                 self.planner_state = 'COMPLETED'
+                self.requested_goal = None
+                self.replan_requested = False
+                self.goal_source = None
                 self.reset_avoidance_state()
                 self.get_logger().info('최종 목표 도착: 정지합니다.')
             return True
@@ -1780,6 +1941,12 @@ class PurePursuitObstacleV2(Node):
                 self.publish_stop('자동주행 잠금: drive_enabled=false')
             self.last_drive_enabled = enabled
         if not enabled:
+            return
+
+        # A completed manual goal or code mission stays latched at zero until
+        # a new valid /goal_pose arrives or the node is restarted.
+        if self.completed:
+            self.publish_stop()
             return
 
         if not self.is_localized or self.last_pose_time is None:

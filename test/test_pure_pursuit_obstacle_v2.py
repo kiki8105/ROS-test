@@ -11,6 +11,7 @@ from my_turtle_pkg.pure_pursuit_obstacle_v2 import (
     propagate_odom_pose,
     pure_pursuit_arc_is_free,
     PurePursuitObstacleV2,
+    validate_mission_waypoints,
     WAFFLE_PI_FRONT_X,
     WAFFLE_PI_LIDAR_X,
     world_to_grid,
@@ -117,6 +118,16 @@ class CapturePathPublisher:
 
 
 class GridAndAStarTests(unittest.TestCase):
+
+    def test_code_mission_waypoints_require_finite_xy_pairs(self):
+        self.assertEqual(
+            validate_mission_waypoints([(1, 2.5), [-3.0, 4]]),
+            [(1.0, 2.5), (-3.0, 4.0)],
+        )
+        with self.assertRaises(ValueError):
+            validate_mission_waypoints([(1.0, 2.0, 3.0)])
+        with self.assertRaises(ValueError):
+            validate_mission_waypoints([(math.nan, 0.0)])
 
     def test_occupancy_threshold_and_unknown_policy(self):
         message = make_map(width=3, height=2, resolution=1.0, origin=(0, 0))
@@ -401,6 +412,84 @@ class IntegratedNodeTests(unittest.TestCase):
 
         self.assertFalse(self.node.is_localized)
         self.assertIsNone(self.node.last_pose_time)
+
+    def test_code_mission_advances_each_wp_and_latches_completion(self):
+        self.node.mission_waypoints = [(0.5, 0.0), (1.0, 0.0)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose())
+        self.tick()
+
+        self.assertEqual(self.node.mission_waypoint_index, 0)
+        self.assertEqual(self.node.requested_goal, (0.5, 0.0))
+        self.assertEqual(self.node.goal_source, 'MISSION')
+        self.assertEqual(self.node.planner_state, 'READY')
+
+        self.set_enabled(True)
+        self.node.pose_callback(make_pose(0.5, 0.0))
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.mission_waypoint_index, 1)
+        self.assertEqual(self.node.requested_goal, (1.0, 0.0))
+        self.assertTrue(self.node.replan_requested)
+        self.assertFalse(self.node.path)
+
+        # The next control tick plans the second A* leg but remains stopped
+        # because no scan is supplied in this unit test.
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.planner_state, 'READY')
+        self.node.pose_callback(make_pose(1.0, 0.0))
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.completed)
+        self.assertTrue(self.node.mission_completed)
+        self.assertFalse(self.node.mission_active)
+        self.assertEqual(self.node.planner_state, 'MISSION_COMPLETED')
+        self.assertIsNone(self.node.requested_goal)
+
+        # Map changes and localization drift cannot restart a finished mission.
+        previous_plan_count = self.node.plan_count
+        changed_map = make_map()
+        changed_map.data[35 * changed_map.info.width + 35] = 100
+        self.node.map_callback(changed_map)
+        self.node.pose_callback(make_pose(0.5, 0.0))
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.plan_count, previous_plan_count)
+        self.assertEqual(self.node.planner_state, 'MISSION_COMPLETED')
+
+    def test_external_goal_permanently_cancels_code_mission(self):
+        self.node.mission_waypoints = [(0.5, 0.0), (1.0, 0.0)]
+        self.assertTrue(self.node.start_code_mission())
+
+        self.node.goal_callback(make_goal(1.5, 0.5))
+
+        self.assertFalse(self.node.mission_active)
+        self.assertFalse(self.node.mission_completed)
+        self.assertEqual(self.node.mission_waypoint_index, -1)
+        self.assertEqual(self.node.goal_source, 'EXTERNAL')
+        self.assertEqual(self.node.requested_goal, (1.5, 0.5))
+
+    def test_unreachable_code_wp_stops_mission_without_skipping(self):
+        self.node.mission_waypoints = [(50.0, 50.0), (0.5, 0.0)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose())
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertFalse(self.node.mission_active)
+        self.assertTrue(self.node.mission_failed)
+        self.assertEqual(self.node.mission_waypoint_index, 0)
+        self.assertEqual(self.node.planner_state, 'MISSION_FAILED')
+        self.assertIsNone(self.node.requested_goal)
+        self.assertFalse(self.node.path)
+
+        plan_count = self.node.plan_count
+        changed_map = make_map()
+        changed_map.data[35 * changed_map.info.width + 35] = 100
+        self.node.map_callback(changed_map)
+        self.tick()
+        self.assertEqual(self.node.plan_count, plan_count)
+        self.assertEqual(self.node.planner_state, 'MISSION_FAILED')
 
 
 if __name__ == '__main__':
