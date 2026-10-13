@@ -5,6 +5,11 @@ pure_pursuit_obstacle_v2:
     # 출발 잠금: Initial Pose, 목표, /plan을 확인한 뒤 true로 변경합니다.
     drive_enabled: false
 
+    # 코드 WP 임무 실패 시 최초 AMCL 위치로 1회 자동 복귀
+    return_home_on_failure: true      # BLOCKED/NO_PATH에서 원 임무를 취소하고 홈으로 복귀
+    return_home_tolerance: 0.20       # 출발지 도착 판정 반경 [m]
+    return_home_timeout: 180.0        # 복귀 제한 시간 [s], 초과 시 안전 정지
+
     # Pure Pursuit 속도와 곡선 추종
     linear_velocity: 0.08             # 정상 선속도 [m/s]
     lookahead_distance: 0.40          # 전방 주시 거리 [m], 크면 완만해짐

@@ -898,6 +898,13 @@ class PurePursuitObstacleV2(Node):
         self.mission_active = False
         self.mission_completed = False
         self.mission_failed = False
+        self.mission_home_pose = None
+        self.mission_home_locked = False
+        self.mission_failure_reason = None
+        self.return_home_active = False
+        self.return_home_attempted = False
+        self.return_home_failed = False
+        self.return_home_started = None
 
         self.latest_scan = None
         self.last_scan_time = None
@@ -919,6 +926,7 @@ class PurePursuitObstacleV2(Node):
         self.replan_after_avoidance = False
         self.spin_block_count = 0
         self.spin_block_last_scan_sequence = -1
+        self.blocked_reason = None
 
         # Separate spatial breadcrumbs are kept in the continuous odom frame.
         # odom_history above serves AMCL timestamp matching and may fill with
@@ -1007,6 +1015,20 @@ class PurePursuitObstacleV2(Node):
             'drive_enabled', False,
             ParameterDescriptor(
                 description='true일 때만 자동주행합니다. false면 즉시 정지합니다.'))
+        self.declare_parameter(
+            'return_home_on_failure', True,
+            ParameterDescriptor(
+                description=(
+                    '코드 WP 임무가 BLOCKED/NO_PATH로 실패하면 '
+                    '최초 AMCL 위치로 A* 복귀합니다.')))
+        self.declare_parameter(
+            'return_home_tolerance', 0.20,
+            floating_descriptor(
+                '홈 복귀 완료 판정 반경 [m].', 0.05, 0.50, 0.01))
+        self.declare_parameter(
+            'return_home_timeout', 180.0,
+            floating_descriptor(
+                '홈 복귀 전체 제한 시간 [s].', 10.0, 600.0, 5.0))
         self.declare_parameter(
             'scan_timeout', 0.5,
             floating_descriptor('LiDAR 미수신 정지 시간 [s].', 0.1, 2.0, 0.1))
@@ -1271,6 +1293,8 @@ class PurePursuitObstacleV2(Node):
         ranges = {
             'scan_timeout': (0.1, 2.0),
             'pose_timeout': (0.1, 10.0),
+            'return_home_tolerance': (0.05, 0.50),
+            'return_home_timeout': (10.0, 600.0),
             'linear_velocity': (0.0, 0.22),
             'avoidance_angular_velocity': (0.05, 1.0),
             'avoidance_linear_velocity': (0.01, 0.15),
@@ -1470,7 +1494,13 @@ class PurePursuitObstacleV2(Node):
         self.blocked = blocked
         self.grid_spec = spec
         self.costmap_dirty = False
-        if self.mission_failed:
+        if self.return_home_active:
+            self.planner_state = 'RETURN_HOME_PLANNING'
+        elif self.completed and self.return_home_attempted:
+            self.planner_state = (
+                'RETURN_HOME_FAILED'
+                if self.return_home_failed else 'RETURNED_HOME')
+        elif self.mission_failed:
             self.planner_state = 'MISSION_FAILED'
         elif self.completed:
             self.planner_state = (
@@ -1526,6 +1556,21 @@ class PurePursuitObstacleV2(Node):
             )
         self.last_amcl_time = now
         self.last_pose_time = now
+        if (
+                self.mission_active
+                and not self.mission_home_locked
+                and not self.return_home_attempted):
+            # Initial Pose can be corrected several times while driving is
+            # locked.  Keep the latest valid AMCL pose as a candidate, then
+            # freeze it at the first drive_enabled=true transition.
+            if bool(self.get_parameter('drive_enabled').value):
+                if self.mission_home_pose is None:
+                    self.mission_home_pose = (
+                        self.current_x, self.current_y, self.current_yaw)
+                self._lock_mission_home()
+            else:
+                self.mission_home_pose = (
+                    self.current_x, self.current_y, self.current_yaw)
         if first_pose:
             self.get_logger().info(
                 f'AMCL 위치 수신: x={x:.3f}, y={y:.3f}, yaw={yaw:.3f}')
@@ -1667,6 +1712,15 @@ class PurePursuitObstacleV2(Node):
                 )
             )
         self.last_pose_time = now
+        if (
+                self.mission_active
+                and not self.mission_home_locked
+                and not self.return_home_attempted
+                and not bool(self.get_parameter('drive_enabled').value)):
+            # A robot can be repositioned while the drive lock is active.
+            # Keep the pre-start home candidate current between AMCL updates.
+            self.mission_home_pose = (
+                self.current_x, self.current_y, self.current_yaw)
 
     def _reset_route_for_new_goal(self):
         """Stop and discard state that belongs to the previous A* leg."""
@@ -1692,6 +1746,121 @@ class PurePursuitObstacleV2(Node):
         self.goal_source = source
         self.planner_state = 'PLANNING'
         self.replan_requested = True
+
+    def _lock_mission_home(self):
+        """Freeze the latest localized pose as this mission's start."""
+        if self.mission_home_locked or not self.is_localized:
+            return False
+        if self.mission_home_pose is None:
+            self.mission_home_pose = (
+                self.current_x, self.current_y, self.current_yaw)
+        self.mission_home_locked = True
+        self.get_logger().info(
+            f'임무 시작 홈 위치 고정: x={self.mission_home_pose[0]:.3f}, '
+            f'y={self.mission_home_pose[1]:.3f}, '
+            f'yaw={self.mission_home_pose[2]:.3f}')
+        return True
+
+    def _complete_return_home(self):
+        """Latch a stopped state after reaching the recorded mission start."""
+        self.return_home_active = False
+        self.return_home_failed = False
+        self.return_home_started = None
+        self.mission_active = False
+        self.mission_completed = False
+        # Preserve the fact that the outbound mission failed even though the
+        # recovery goal succeeded.
+        self.mission_failed = True
+        self.mission_home_locked = True
+        self.completed = True
+        self.path = []
+        self.path_cells = []
+        self.current_waypoint_index = 0
+        self.segment_start = None
+        self.active_goal = None
+        self.requested_goal = None
+        self.requested_goal_yaw = 0.0
+        self.replan_requested = False
+        self.goal_source = None
+        self.planner_state = 'RETURNED_HOME'
+        self.reset_avoidance_state()
+        self.publish_path()
+        self.publish_stop()
+        self.get_logger().info(
+            '홈 복귀 완료: 원 임무는 실패 상태로 유지하고 '
+            '출발 위치에서 정지합니다.')
+        return True
+
+    def _fail_return_home(self, reason):
+        """Stop permanently when the one allowed home return also fails."""
+        self.return_home_active = False
+        self.return_home_failed = True
+        self.return_home_started = None
+        self.mission_active = False
+        self.mission_completed = False
+        self.mission_failed = True
+        self.mission_home_locked = True
+        self.path = []
+        self.path_cells = []
+        self.current_waypoint_index = 0
+        self.segment_start = None
+        self.active_goal = None
+        self.requested_goal = None
+        self.requested_goal_yaw = 0.0
+        self.replan_requested = False
+        self.goal_source = None
+        self.completed = True
+        self.reset_avoidance_state('RETURN_FAILED')
+        self.planner_state = 'RETURN_HOME_FAILED'
+        self.publish_path()
+        self.publish_stop()
+        self.get_logger().error(
+            f'홈 복귀 실패: {reason}. '
+            '자동 복귀를 반복하지 않고 안전 정지합니다.')
+        return False
+
+    def _start_return_home(self, reason):
+        """Cancel the outbound mission and request one A* route home."""
+        if self.return_home_active or self.return_home_attempted:
+            return False
+        self.return_home_attempted = True
+        self.mission_home_locked = True
+        self.mission_failure_reason = str(reason)
+        failed_waypoint = self.mission_waypoint_index + 1
+        total_waypoints = len(self.mission_waypoints)
+
+        if self.mission_home_pose is None:
+            self.mission_active = False
+            self.mission_completed = False
+            self.mission_failed = True
+            self.planner_state = 'MISSION_FAILED'
+            self.get_logger().error(
+                f'임무 실패: {reason}. '
+                '최초 AMCL 홈 위치가 없어 복귀할 수 없습니다.')
+            return False
+
+        self.mission_active = False
+        self.mission_completed = False
+        self.mission_failed = True
+        self.return_home_active = True
+        self.return_home_failed = False
+        self.return_home_started = self.get_clock().now()
+        home_x, home_y, home_yaw = self.mission_home_pose
+        home_distance = math.hypot(
+            home_x - self.current_x, home_y - self.current_y)
+        self.get_logger().warn(
+            f'코드 WP 임무 실패 '
+            f'({failed_waypoint}/{total_waypoints}): {reason}. '
+            f'원 임무를 취소하고 홈 '
+            f'({home_x:.2f}, {home_y:.2f})으로 복귀합니다.')
+        if home_distance <= float(
+                self.get_parameter('return_home_tolerance').value):
+            return self._complete_return_home()
+
+        self._activate_goal(
+            home_x, home_y, home_yaw, source='RETURN_HOME')
+        self.planner_state = 'RETURN_HOME_PLANNING'
+        return True
 
     def mission_goal_yaw(self, index):
         """Use the next mission leg direction for Path visualization."""
@@ -1723,6 +1892,18 @@ class PurePursuitObstacleV2(Node):
         if not self.mission_waypoints:
             self.get_logger().warn('실행할 코드 WP가 없습니다.')
             return False
+        self.mission_home_pose = (
+            (self.current_x, self.current_y, self.current_yaw)
+            if self.is_localized else None
+        )
+        self.mission_home_locked = bool(
+            self.is_localized
+            and self.get_parameter('drive_enabled').value)
+        self.mission_failure_reason = None
+        self.return_home_active = False
+        self.return_home_attempted = False
+        self.return_home_failed = False
+        self.return_home_started = None
         self.mission_active = True
         self.mission_completed = False
         self.mission_failed = False
@@ -1730,12 +1911,22 @@ class PurePursuitObstacleV2(Node):
 
     def cancel_code_mission(self, reason):
         """Permanently cancel the code mission when an external goal arrives."""
-        if self.mission_active or self.mission_waypoint_index >= 0:
+        if (
+                self.mission_active
+                or self.return_home_active
+                or self.mission_waypoint_index >= 0):
             self.get_logger().info(f'코드 WP 임무 취소: {reason}')
         self.mission_active = False
         self.mission_completed = False
         self.mission_failed = False
         self.mission_waypoint_index = -1
+        self.mission_home_pose = None
+        self.mission_home_locked = False
+        self.mission_failure_reason = None
+        self.return_home_active = False
+        self.return_home_attempted = False
+        self.return_home_failed = False
+        self.return_home_started = None
 
     def _advance_code_mission(self):
         """Stop at the reached WP and queue the next code-defined goal."""
@@ -1911,6 +2102,11 @@ class PurePursuitObstacleV2(Node):
     def clear_path(self, reason, state='NO_PATH'):
         """Discard stale planning output, reset avoidance, and stop."""
         mission_failure = self.mission_active and state == 'NO_PATH'
+        return_home_failure = (
+            self.return_home_active
+            and self.goal_source == 'RETURN_HOME'
+            and state == 'NO_PATH'
+        )
         self.path = []
         self.path_cells = []
         self.current_waypoint_index = 0
@@ -1921,7 +2117,24 @@ class PurePursuitObstacleV2(Node):
         self.replan_requested = False
         self.arc_replan_pose = None
         self.reset_avoidance_state()
+        self.publish_path()
+        self.publish_stop()
+        self.get_logger().error(reason)
+
+        if return_home_failure:
+            self._fail_return_home(f'A* 복귀 경로 생성 실패: {reason}')
+            return
+
         if mission_failure:
+            self.get_logger().error(
+                f'코드 WP 임무 중단: '
+                f'{self.mission_waypoint_index + 1}/'
+                f'{len(self.mission_waypoints)} 경로 생성 실패')
+            if (
+                    bool(self.get_parameter(
+                        'return_home_on_failure').value)
+                    and self._start_return_home(reason)):
+                return
             self.mission_active = False
             self.mission_completed = False
             self.mission_failed = True
@@ -1930,17 +2143,9 @@ class PurePursuitObstacleV2(Node):
             self.goal_source = None
             self.planner_state = 'MISSION_FAILED'
         else:
-            if not self.mission_active:
+            if not self.mission_active and not self.return_home_active:
                 self.goal_source = None
             self.planner_state = state
-        self.publish_path()
-        self.publish_stop()
-        self.get_logger().error(reason)
-        if mission_failure:
-            self.get_logger().error(
-                f'코드 WP 임무 중단: '
-                f'{self.mission_waypoint_index + 1}/'
-                f'{len(self.mission_waypoints)} 경로 생성 실패')
 
     def plan_path(self, reason):
         """Plan from the current AMCL pose to the requested goal."""
@@ -1987,6 +2192,11 @@ class PurePursuitObstacleV2(Node):
         if free_goal is None:
             self.clear_path('목표 주변에 자유 셀이 없습니다.')
             return False
+        if self.goal_source == 'RETURN_HOME' and free_goal != goal_cell:
+            self.clear_path(
+                '기록된 홈 위치가 팽창 장애물 안에 있어 안전하게 '
+                '정확한 출발 위치로 복귀할 수 없습니다.')
+            return False
 
         cells = astar_path(
             self.blocked,
@@ -2031,10 +2241,16 @@ class PurePursuitObstacleV2(Node):
         self.plan_count += 1
         self.replan_requested = False
         self.replan_after_avoidance = False
-        self.planner_state = 'READY'
+        self.planner_state = (
+            'RETURNING_HOME'
+            if self.goal_source == 'RETURN_HOME'
+            else 'READY'
+        )
         self.publish_path()
+        route_name = '홈 복귀 A*' if self.goal_source == 'RETURN_HOME' else 'A*'
         self.get_logger().info(
-            f'A* 경로 생성({reason}): 안전 추종점 {len(world_path)}개 '
+            f'{route_name} 경로 생성({reason}): '
+            f'안전 추종점 {len(world_path)}개 '
             f'(단순화 시 {len(simplified)}개), 계획 #{self.plan_count}')
         if free_goal != goal_cell:
             adjusted_x, adjusted_y = world_path[-1]
@@ -2065,6 +2281,7 @@ class PurePursuitObstacleV2(Node):
         self.backtrack_start_odom = None
         self.backtrack_planned_distance = 0.0
         self._reset_backtrack_release_confirmation()
+        self.blocked_reason = None
 
     def _reset_spin_block_confirmation(self):
         """Forget a partial close-scan streak used to authorize reversing."""
@@ -2078,6 +2295,8 @@ class PurePursuitObstacleV2(Node):
 
     def set_avoidance_state(self, state, reason):
         """Change local avoidance state and log the transition."""
+        if state == 'BLOCKED':
+            self.blocked_reason = str(reason)
         if state != self.avoidance_state:
             self.avoidance_state = state
             self.avoidance_active = state in (
@@ -2163,7 +2382,22 @@ class PurePursuitObstacleV2(Node):
             self.active_goal[0] - self.current_x,
             self.active_goal[1] - self.current_y,
         )
-        if goal_distance <= float(self.get_parameter('goal_tolerance').value):
+        goal_tolerance = float(self.get_parameter(
+            'return_home_tolerance'
+            if self.goal_source == 'RETURN_HOME'
+            else 'goal_tolerance'
+        ).value)
+        if goal_distance <= goal_tolerance:
+            if (
+                    self.goal_source == 'RETURN_HOME'
+                    and self.return_home_active):
+                home_x, home_y, _ = self.mission_home_pose
+                home_distance = math.hypot(
+                    home_x - self.current_x,
+                    home_y - self.current_y,
+                )
+                if home_distance <= goal_tolerance:
+                    return self._complete_return_home()
             if self.goal_source == 'MISSION' and self.mission_active:
                 return self._advance_code_mission()
             if not self.completed:
@@ -3163,7 +3397,8 @@ class PurePursuitObstacleV2(Node):
             dt = period
         self.last_control_time = now
 
-        avoiding = self.avoidance_state in ('TURN', 'BYPASS', 'BACKTRACK')
+        avoiding = self.avoidance_state in (
+            'TURN', 'BYPASS', 'BACKTRACK', 'BLOCKED')
         if self.costmap_dirty and not avoiding:
             self.rebuild_costmap()
         if (
@@ -3172,9 +3407,26 @@ class PurePursuitObstacleV2(Node):
                 and not avoiding):
             self.plan_path('새 목표/지도/파라미터')
 
+        # BLOCKED is a terminal local-recovery result.  Handle it before the
+        # drive lock and pose-freshness checks so a simultaneous pause or
+        # sensor delay cannot erase the mission failure on the next tick.
+        if self.avoidance_state == 'BLOCKED':
+            reason = self.blocked_reason or '지역 회복 실패'
+            if self.return_home_active:
+                self._fail_return_home(reason)
+            elif (
+                    self.mission_active
+                    and bool(self.get_parameter(
+                        'return_home_on_failure').value)):
+                self._start_return_home(reason)
+            self.publish_stop()
+            return
+
         enabled = bool(self.get_parameter('drive_enabled').value)
         if enabled != self.last_drive_enabled:
             if enabled:
+                if self.mission_active and not self.mission_home_locked:
+                    self._lock_mission_home()
                 self.get_logger().info('자동주행 시작: drive_enabled=true')
             else:
                 self.reset_avoidance_state()
@@ -3183,6 +3435,20 @@ class PurePursuitObstacleV2(Node):
             self.last_drive_enabled = enabled
         if not enabled:
             return
+
+        if self.return_home_active and self.return_home_started is not None:
+            return_elapsed = (
+                now - self.return_home_started).nanoseconds / 1e9
+            return_timeout = float(
+                self.get_parameter('return_home_timeout').value)
+            if (
+                    not math.isfinite(return_elapsed)
+                    or return_elapsed < 0.0
+                    or return_elapsed > return_timeout):
+                self._fail_return_home(
+                    f'복귀 제한 시간 초과 '
+                    f'({return_elapsed:.1f}s > {return_timeout:.1f}s)')
+                return
 
         # A completed manual goal or code mission stays latched at zero until
         # a new valid /goal_pose arrives or the node is restarted.
@@ -3267,9 +3533,6 @@ class PurePursuitObstacleV2(Node):
             self.reset_avoidance_state()
             self.get_logger().info('센서 입력 회복: TRACK 재개')
 
-        if self.avoidance_state == 'BLOCKED':
-            self.publish_stop()
-            return
         if self.avoidance_state == 'BACKTRACK':
             self.backtrack_command(metrics, now, dt)
             return

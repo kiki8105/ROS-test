@@ -1306,6 +1306,231 @@ class IntegratedNodeTests(unittest.TestCase):
         self.assertEqual(self.node.plan_count, previous_plan_count)
         self.assertEqual(self.node.planner_state, 'MISSION_COMPLETED')
 
+    def test_latest_pose_before_drive_enabled_is_locked_as_home(self):
+        self.node.mission_home_pose = None
+        self.node.mission_home_locked = False
+        self.node.pose_callback(make_pose(0.0, 0.5, 0.25))
+
+        self.assertAlmostEqual(self.node.mission_home_pose[0], 0.0)
+        self.assertAlmostEqual(self.node.mission_home_pose[1], 0.5)
+        self.assertAlmostEqual(self.node.mission_home_pose[2], 0.25)
+        self.assertFalse(self.node.mission_home_locked)
+
+        self.node.pose_callback(make_pose(1.0, 2.0, 0.75))
+        self.assertAlmostEqual(self.node.mission_home_pose[0], 1.0)
+        self.assertAlmostEqual(self.node.mission_home_pose[1], 2.0)
+        self.assertAlmostEqual(self.node.mission_home_pose[2], 0.75)
+
+        self.set_enabled(True)
+        self.tick()
+        self.assertTrue(self.node.mission_home_locked)
+
+        # Later AMCL motion cannot move the recorded mission start.
+        self.node.pose_callback(make_pose(2.0, 3.0, 1.0))
+        self.assertAlmostEqual(self.node.mission_home_pose[0], 1.0)
+        self.assertAlmostEqual(self.node.mission_home_pose[1], 2.0)
+        self.assertAlmostEqual(self.node.mission_home_pose[2], 0.75)
+
+    def test_odom_motion_updates_unlocked_home_candidate(self):
+        self.node.mission_home_pose = None
+        self.node.mission_home_locked = False
+        self.node.odom_callback(make_odom(0.0, 0.0, 0.0))
+        self.node.pose_callback(make_pose(0.0, 0.5, 0.0))
+        self.node.odom_callback(make_odom(0.2, -0.1, 0.1))
+
+        self.assertAlmostEqual(self.node.mission_home_pose[0], 0.2)
+        self.assertAlmostEqual(self.node.mission_home_pose[1], 0.4)
+        self.assertAlmostEqual(self.node.mission_home_pose[2], 0.1)
+        self.assertFalse(self.node.mission_home_locked)
+
+        self.set_enabled(True)
+        self.tick()
+        self.assertTrue(self.node.mission_home_locked)
+        self.assertAlmostEqual(self.node.mission_home_pose[0], 0.2)
+        self.assertAlmostEqual(self.node.mission_home_pose[1], 0.4)
+        self.assertAlmostEqual(self.node.mission_home_pose[2], 0.1)
+
+    def test_blocked_code_mission_requests_one_astar_return_home(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '테스트 주행 정지')
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertFalse(self.node.mission_active)
+        self.assertTrue(self.node.mission_failed)
+        self.assertTrue(self.node.return_home_active)
+        self.assertTrue(self.node.return_home_attempted)
+        self.assertFalse(self.node.return_home_failed)
+        self.assertEqual(self.node.goal_source, 'RETURN_HOME')
+        self.assertEqual(self.node.requested_goal, (0.0, 0.5))
+        self.assertEqual(self.node.planner_state, 'RETURN_HOME_PLANNING')
+
+        linear, angular = self.tick()
+        self.assertEqual(linear, 0.0)
+        self.assertNotEqual(angular, 0.0)
+        self.assertEqual(self.node.planner_state, 'RETURNING_HOME')
+        self.assertTrue(self.node.path)
+
+    def test_return_home_arrival_latches_failed_mission_at_home(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '테스트 주행 정지')
+        self.tick()
+        self.tick()
+
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.completed)
+        self.assertTrue(self.node.mission_failed)
+        self.assertFalse(self.node.mission_completed)
+        self.assertFalse(self.node.return_home_active)
+        self.assertFalse(self.node.return_home_failed)
+        self.assertEqual(self.node.planner_state, 'RETURNED_HOME')
+        self.assertIsNone(self.node.requested_goal)
+        self.assertFalse(self.node.path)
+
+    def test_second_block_during_return_home_fails_without_restart(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '원 임무 실패')
+        self.tick()
+        self.tick()
+        self.assertTrue(self.node.return_home_active)
+
+        self.node.set_avoidance_state('BLOCKED', '복귀 경로도 막힘')
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.completed)
+        self.assertTrue(self.node.return_home_attempted)
+        self.assertFalse(self.node.return_home_active)
+        self.assertTrue(self.node.return_home_failed)
+        self.assertEqual(self.node.planner_state, 'RETURN_HOME_FAILED')
+        self.assertIsNone(self.node.requested_goal)
+
+        # A later tick remains stopped and cannot recursively request HOME.
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.planner_state, 'RETURN_HOME_FAILED')
+
+    def test_return_home_timeout_latches_failure_without_restart(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '원 임무 실패')
+        self.tick()
+        self.assertTrue(self.node.return_home_active)
+
+        self.node.return_home_started = (
+            self.node.get_clock().now() - Duration(seconds=181.0))
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.completed)
+        self.assertFalse(self.node.return_home_active)
+        self.assertTrue(self.node.return_home_failed)
+        self.assertEqual(self.node.planner_state, 'RETURN_HOME_FAILED')
+
+        # The timeout is terminal; later ticks cannot create another return.
+        plan_count = self.node.plan_count
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.plan_count, plan_count)
+        self.assertEqual(self.node.planner_state, 'RETURN_HOME_FAILED')
+
+    def test_blocked_failure_survives_drive_disable_before_next_tick(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.tick()
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '잠금 직전 임무 실패')
+
+        self.set_enabled(False)
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.return_home_active)
+        self.assertTrue(self.node.return_home_attempted)
+        self.assertEqual(self.node.goal_source, 'RETURN_HOME')
+        self.assertEqual(self.node.requested_goal, (0.0, 0.5))
+
+    def test_blocked_failure_survives_stale_pose_before_next_tick(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.tick()
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '위치 지연 직전 임무 실패')
+        self.node.last_pose_time = (
+            self.node.get_clock().now() - Duration(seconds=5.0))
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.return_home_active)
+        self.assertTrue(self.node.return_home_attempted)
+        self.assertEqual(self.node.goal_source, 'RETURN_HOME')
+        self.assertEqual(self.node.requested_goal, (0.0, 0.5))
+
+    def test_occupied_exact_home_fails_return_instead_of_snapping(self):
+        self.node.mission_waypoints = [(1.0, 0.5)]
+        self.assertTrue(self.node.start_code_mission())
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.5))
+        self.tick()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        self.tick()
+        self.node.pose_callback(make_pose(0.5, 0.5))
+        self.node.set_avoidance_state('BLOCKED', '원 임무 실패')
+        self.tick()
+        self.assertTrue(self.node.return_home_active)
+
+        home_cell = world_to_grid(0.0, 0.5, self.node.grid_spec)
+        home_index = (
+            home_cell[1] * self.node.grid_spec.width + home_cell[0])
+        self.node.blocked[home_index] = True
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertTrue(self.node.completed)
+        self.assertFalse(self.node.return_home_active)
+        self.assertTrue(self.node.return_home_failed)
+        self.assertEqual(self.node.planner_state, 'RETURN_HOME_FAILED')
+        self.assertIsNone(self.node.requested_goal)
+
+        # A later tick remains terminal and cannot snap to another free cell.
+        plan_count = self.node.plan_count
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.plan_count, plan_count)
+
     def test_external_goal_permanently_cancels_code_mission(self):
         self.node.mission_waypoints = [(0.5, 0.0), (1.0, 0.0)]
         self.assertTrue(self.node.start_code_mission())
@@ -1329,9 +1554,12 @@ class IntegratedNodeTests(unittest.TestCase):
         self.assertFalse(self.node.mission_active)
         self.assertTrue(self.node.mission_failed)
         self.assertEqual(self.node.mission_waypoint_index, 0)
-        self.assertEqual(self.node.planner_state, 'MISSION_FAILED')
+        self.assertEqual(self.node.planner_state, 'RETURNED_HOME')
         self.assertIsNone(self.node.requested_goal)
         self.assertFalse(self.node.path)
+        self.assertTrue(self.node.completed)
+        self.assertTrue(self.node.return_home_attempted)
+        self.assertFalse(self.node.return_home_active)
 
         plan_count = self.node.plan_count
         changed_map = make_map()
@@ -1339,7 +1567,7 @@ class IntegratedNodeTests(unittest.TestCase):
         self.node.map_callback(changed_map)
         self.tick()
         self.assertEqual(self.node.plan_count, plan_count)
-        self.assertEqual(self.node.planner_state, 'MISSION_FAILED')
+        self.assertEqual(self.node.planner_state, 'RETURNED_HOME')
 
 
 if __name__ == '__main__':
