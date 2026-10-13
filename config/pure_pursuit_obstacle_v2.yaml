@@ -40,7 +40,7 @@ pure_pursuit_obstacle_v2:
 
     # 선회 공간이 실제로 막혔을 때 직전 /odom 주행 궤적 역추종
     backtrack_distance: 0.22          # 한 번에 되돌아갈 목표 거리 [m]
-    backtrack_min_distance: 0.10      # 저장 궤적이 이보다 짧으면 후진하지 않음 [m]
+    backtrack_min_distance: 0.06      # 재계획 직후에도 쓸 수 있는 최소 직선 궤적 [m]
     backtrack_velocity: 0.03          # 저속 후진 속도 절댓값 [m/s]
     backtrack_lookahead_distance: 0.08 # 후진 Pure Pursuit 주시 거리 [m]
     backtrack_goal_tolerance: 0.03    # 후진 breadcrumb 통과 반경 [m]
@@ -50,7 +50,7 @@ pure_pursuit_obstacle_v2:
     backtrack_lateral_tolerance: 0.03 # 현재 후진 직선에서 허용할 직전 궤적 횡편차 [m]
     backtrack_timeout: 12.0           # 0.22m 저속 후진+가감속을 포함한 제한 시간 [s]
     forward_trail_spacing: 0.02       # 실제 전진 궤적 저장 간격 [m]
-    backtrack_retry_limit: 1          # 같은 장애물에서 허용할 후진 횟수
+    backtrack_retry_limit: 2          # 같은 장애물 구역에서 최대 2회 후진, 이후 안전 정지
 
     # TURN → BYPASS 장애물 회피
     avoidance_angular_velocity: 0.23  # 장애물 앞 선회 속도 [rad/s]

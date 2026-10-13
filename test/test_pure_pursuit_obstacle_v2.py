@@ -636,6 +636,37 @@ class IntegratedNodeTests(unittest.TestCase):
         self.assertEqual(path, [])
         self.assertAlmostEqual(distance, 0.04)
 
+    def test_second_short_backtrack_is_allowed_but_third_is_blocked(self):
+        """A successful replan may need one more bounded local recovery."""
+        now = self.node.get_clock().now()
+        self.node.backtrack_attempts = 1
+        self.node.backtrack_trigger_pose = (0.0, 0.0)
+        self.node.current_x = 0.05
+        self.node.current_y = 0.0
+        self.node.latest_odom_pose = (0.0, 0.0, 0.0)
+        self.node.last_odom_time = now
+        self.node.forward_trail.clear()
+        self.node.forward_trail.extend([
+            (-0.08, 0.0, 0.0),
+            (-0.06, 0.0, 0.0),
+            (-0.04, 0.0, 0.0),
+            (-0.02, 0.0, 0.0),
+        ])
+        metrics = {
+            'rear_range_count': 20,
+            'rear': math.inf,
+        }
+
+        self.assertTrue(self.node.start_backtrack(metrics, now))
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.backtrack_attempts, 2)
+        self.assertGreaterEqual(self.node.backtrack_planned_distance, 0.06)
+
+        self.node._clear_backtrack_path()
+        self.node.avoidance_state = 'TRACK'
+        self.assertFalse(self.node.start_backtrack(metrics, now))
+        self.assertEqual(self.node.avoidance_state, 'BLOCKED')
+
     def test_single_close_spin_scan_stops_without_permanent_block(self):
         close_scan = self.prepare_backtrack_case()
         self.node.scan_callback(close_scan)

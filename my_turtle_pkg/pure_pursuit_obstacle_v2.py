@@ -1084,7 +1084,7 @@ class PurePursuitObstacleV2(Node):
                 '선회 불가 시 직전 실제 궤적을 따라 후진할 거리 [m].',
                 0.08, 0.60, 0.01))
         self.declare_parameter(
-            'backtrack_min_distance', 0.10,
+            'backtrack_min_distance', 0.06,
             floating_descriptor(
                 'BACKTRACK 진입에 필요한 최소 저장 궤적 길이 [m].',
                 0.05, 0.40, 0.01))
@@ -1134,9 +1134,9 @@ class PurePursuitObstacleV2(Node):
                 '실제 전진 궤적 breadcrumb 저장 간격 [m].',
                 0.01, 0.10, 0.01))
         self.declare_parameter(
-            'backtrack_retry_limit', 1,
+            'backtrack_retry_limit', 2,
             integer_descriptor(
-                '한 장애물에서 허용할 직전 궤적 후진 횟수.', 0, 3))
+                '한 장애물 구역에서 허용할 직전 궤적 후진 횟수.', 0, 3))
         self.declare_parameter(
             'minimum_turn_angle', 0.35,
             floating_descriptor('우회 전 반드시 선회할 최소 각도 [rad].', 0.10, 1.57, 0.01))
@@ -2442,7 +2442,8 @@ class PurePursuitObstacleV2(Node):
         self.set_avoidance_state(
             'BACKTRACK',
             f'선회 불가가 연속 확인되어 직전 실제 궤적 '
-            f'{distance:.2f}m 역추종')
+            f'{distance:.2f}m 역추종 '
+            f'({self.backtrack_attempts}/{retry_limit}회)')
         # A forward command can still be held by the acceleration limiter.
         # Zero it on entry and allow negative velocity only from the next tick.
         self.publish_stop()
