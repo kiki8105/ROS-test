@@ -282,6 +282,62 @@ class GridAndAStarTests(unittest.TestCase):
 
         self.assertIsNone(recovery)
 
+    def test_recovery_accepts_one_map_cell_lookahead(self):
+        spec = GridSpec(20, 5, 0.05, 0.0, -0.1, 0.0)
+        blocked = [False] * (spec.width * spec.height)
+        obstacle = world_to_grid(0.10, 0.0, spec)
+        blocked[obstacle[1] * spec.width + obstacle[0]] = True
+        path = [
+            (0.0, 0.0),
+            (0.05, 0.0),
+            (0.10, 0.0),
+            (0.20, 0.0),
+            (0.40, 0.0),
+        ]
+
+        self.assertIsNone(select_collision_free_lookahead(
+            blocked, spec, 0.0, 0.0, 0.0, path[0], path, 1,
+            preferred_distance=0.40,
+            minimum_distance=0.12,
+        ))
+        recovery = select_collision_free_lookahead(
+            blocked, spec, 0.0, 0.0, 0.0, path[0], path, 1,
+            preferred_distance=0.40,
+            minimum_distance=0.05,
+        )
+
+        self.assertIsNotNone(recovery)
+        distance, alpha, used_lookahead = recovery
+        self.assertAlmostEqual(distance, 0.05)
+        self.assertAlmostEqual(alpha, 0.0)
+        self.assertAlmostEqual(used_lookahead, 0.05)
+
+    def test_right_angle_is_preserved_but_astar_staircase_is_smoothed(self):
+        right_angle_path = [
+            (0.0, 0.0),
+            (0.05, 0.0),
+            (0.05, 0.40),
+        ]
+        target = select_lookahead_point(
+            0.0, 0.0, right_angle_path[0], right_angle_path, 1, 0.40,
+            corner_angle_limit=1.0,
+        )
+        self.assertEqual(target, right_angle_path[1])
+
+        staircase_path = [
+            (0.0, 0.0),
+            (0.05, 0.0),
+            (0.10, 0.05),
+            (0.15, 0.05),
+            (0.20, 0.10),
+            (0.40, 0.10),
+        ]
+        target = select_lookahead_point(
+            0.0, 0.0, staircase_path[0], staircase_path, 1, 0.30,
+            corner_angle_limit=1.0,
+        )
+        self.assertGreater(math.hypot(*target), 0.20)
+
 
 class IntegratedNodeTests(unittest.TestCase):
 
@@ -336,6 +392,7 @@ class IntegratedNodeTests(unittest.TestCase):
             ),
         ]
         self.node.blocked = blocked
+        self.node.raw_blocked = list(blocked)
         self.node.grid_spec = spec
         self.node.costmap_dirty = False
         self.node.current_x = 0.75
@@ -579,6 +636,81 @@ class IntegratedNodeTests(unittest.TestCase):
 
         self.assertEqual(self.tick(), (0.0, 0.0))
         self.assertEqual(self.node.avoidance_state, 'TRACK')
+
+    def test_sharp_corner_is_not_skipped_before_reaching_it(self):
+        self.node.grid_spec = GridSpec(40, 40, 0.05, -1.0, -1.0, 0.0)
+        self.node.path = [(0.0, 0.0), (0.05, 0.0), (0.05, 0.40)]
+        self.node.segment_start = self.node.path[0]
+        self.node.current_waypoint_index = 1
+        self.node.active_goal = self.node.path[-1]
+        self.node.current_x = 0.0
+        self.node.current_y = 0.0
+
+        self.assertFalse(self.node.advance_waypoints())
+        self.assertEqual(self.node.current_waypoint_index, 1)
+
+        self.node.current_x = 0.02
+        self.assertFalse(self.node.advance_waypoints())
+        self.assertEqual(self.node.current_waypoint_index, 1)
+
+        self.node.current_x = 0.03
+        self.assertFalse(self.node.advance_waypoints())
+        self.assertEqual(self.node.current_waypoint_index, 2)
+
+    def test_inflation_only_block_starts_short_escape(self):
+        blocked = [True] * (120 * 80)
+        current_cell = (62, 25)
+        blocked[current_cell[1] * 120 + current_cell[0]] = False
+        self.prepare_corner_tracking(blocked)
+        self.node.raw_blocked = [False] * len(blocked)
+
+        linear, _ = self.tick()
+
+        self.assertGreater(linear, 0.0)
+        self.assertEqual(self.node.avoidance_state, 'BYPASS')
+
+    def test_close_left_side_turns_right_before_inflation_escape(self):
+        blocked = [True] * (120 * 80)
+        current_cell = (62, 25)
+        blocked[current_cell[1] * 120 + current_cell[0]] = False
+        self.prepare_corner_tracking(blocked)
+        self.node.raw_blocked = [False] * len(blocked)
+        self.node.scan_callback(
+            scan_with_front_gap(2.0, left=0.30, right=2.0))
+
+        linear, angular = self.tick()
+
+        self.assertEqual(linear, 0.0)
+        self.assertLess(angular, 0.0)
+        self.assertEqual(self.node.avoidance_state, 'TURN')
+        self.assertEqual(self.node.turn_direction, -1.0)
+
+    def test_same_pose_arc_replan_is_not_repeated(self):
+        blocked = [True] * (120 * 80)
+        current_cell = (62, 25)
+        blocked[current_cell[1] * 120 + current_cell[0]] = False
+        self.prepare_corner_tracking(blocked)
+        calls = []
+
+        def fake_plan(reason):
+            calls.append(reason)
+            self.node.last_plan_time = self.node.get_clock().now()
+            self.node.publish_stop()
+            return True
+
+        self.node.plan_path = fake_plan
+        self.node.last_plan_time = (
+            self.node.get_clock().now() - Duration(seconds=2.0))
+        self.tick()
+        self.assertEqual(len(calls), 1)
+
+        self.node.last_plan_time = (
+            self.node.get_clock().now() - Duration(seconds=2.0))
+        self.tick()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(self.node.avoidance_state, 'BLOCKED')
+        self.assertEqual(self.twists.commands[-1], (0.0, 0.0))
 
     def test_intermediate_corner_is_not_skipped_at_full_tolerance(self):
         self.node.grid_spec = GridSpec(40, 40, 0.05, -1.0, -1.0, 0.0)

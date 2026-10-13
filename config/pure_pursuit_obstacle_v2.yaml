@@ -8,6 +8,8 @@ pure_pursuit_obstacle_v2:
     # Pure Pursuit 속도와 곡선 추종
     linear_velocity: 0.08             # 정상 선속도 [m/s]
     lookahead_distance: 0.40          # 전방 주시 거리 [m], 크면 완만해짐
+    minimum_lookahead_distance: 0.05  # 코너에서 줄일 수 있는 최소 주시 거리 [m]
+    corner_angle_limit: 1.00          # 이 각도 이상의 큰 코너는 반드시 경유 [rad]
     goal_tolerance: 0.20              # 최종 목표 도착 반경 [m]
     path_point_tolerance: 0.12        # A* 중간 경로점 통과 반경 [m]
     max_angular_velocity: 0.60        # 각속도 절대 상한 [rad/s]
@@ -43,6 +45,7 @@ pure_pursuit_obstacle_v2:
     turn_direction_deadband: 0.05     # 좌우 거리 동률 범위 [m]
     minimum_turn_angle: 0.35          # BYPASS 전 최소 선회각 [rad]
     side_clearance: 0.35              # 측면 목표 간격 [m]
+    side_obstacle_threshold: 0.50     # 복구 시 반대로 선회할 측면 거리 [m]
     wall_follow_gain: 0.80            # 측면 거리 보정 게인
     avoidance_min_duration: 1.0       # 경로 복귀 전 최소 회피 시간 [s]
     avoidance_max_duration: 15.0      # 한 방향 회피 제한 시간 [s]
