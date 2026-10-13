@@ -1,0 +1,16 @@
+drive_mode_manager:
+  ros__parameters:
+    use_sim_time: true
+    operation_mode: outdoor       # outdoor | indoor | auto
+    gps_cmd_topic: /cmd_vel/gps
+    vision_cmd_topic: /cmd_vel/vision
+    output_topic: /cmd_vel
+    source_topic: /navigation/position_source
+    vision_valid_topic: /vision/line_valid
+    command_timeout: 0.5
+    gps_recovery_hold: 3.0        # GPS 복구 후 이 시간 동안 안정적이어야 복귀 [s]
+    max_linear_speed: 0.20
+    max_angular_speed: 0.70
+    max_linear_accel: 0.25
+    max_angular_accel: 1.0
+    publish_rate: 20.0

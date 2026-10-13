@@ -1,0 +1,13 @@
+autorace_lane_follower:
+  ros__parameters:
+    use_sim_time: true
+    image_topic: /camera/image_raw
+    line_valid_topic: /vision/line_valid
+    lane_error_topic: /vision/lane_error
+    roi_top: 0.55
+    lane_half_width_px: 115.0
+    min_pixels: 100
+    valid_frames: 3
+    lost_frames: 3
+    image_timeout: 0.6
+    publish_debug: true

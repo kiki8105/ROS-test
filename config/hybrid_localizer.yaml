@@ -1,0 +1,33 @@
+gps_fault_injector:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: /fix/raw
+    output_topic: /fix
+    mode: normal                 # normal | dropout | freeze | degraded | no_fix
+    degraded_stddev_m: 5.0      # degraded 모드 수평 1-sigma 오차 [m]
+    random_seed: 64
+
+hybrid_localizer:
+  ros__parameters:
+    use_sim_time: true
+    fix_topic: /fix
+    imu_topic: /imu
+    odom_topic: /odom
+    amcl_topic: /amcl_pose
+    camera_topic: /camera/image_raw
+    output_topic: /hybrid_pose
+    frame_id: map
+
+    # gps_test.world의 spherical_coordinates 원점과 같아야 한다.
+    datum_latitude: 37.5665
+    datum_longitude: 126.9780
+
+    # GPS ENU 좌표를 저장 지도(map)에 맞출 때 사용하는 2D 정합값.
+    map_offset_x: 0.0
+    map_offset_y: 0.0
+    map_yaw_offset: 0.0
+
+    gps_timeout: 1.0
+    imu_timeout: 0.5
+    max_gps_stddev_m: 1.0
+    publish_rate: 20.0

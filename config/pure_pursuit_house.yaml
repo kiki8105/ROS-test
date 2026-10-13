@@ -1,0 +1,26 @@
+pure_pursuit_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # Pure Pursuit 형상·도착 판정
+    lookahead_distance: 0.50       # 전방 주시 거리 [m] — 높이면 완만, 낮추면 민감
+    goal_tolerance: 0.20           # 경유점 도착 허용 반경 [m]
+
+    # 속도와 변화율 — 조종기 파라미터 창에서 실행 중 변경 가능
+    drive_enabled: false           # 초기 위치 지정만으로 출발하지 않음. 경로 확인 후 true
+    linear_velocity: 0.10          # 목표 선속도 [m/s]
+    max_angular_velocity: 1.00     # 최대 각속도 [rad/s]
+    linear_acceleration_limit: 0.15   # 선형 가속·감속 한계 [m/s^2]
+    angular_acceleration_limit: 0.80  # 각가속·감속 한계 [rad/s^2]
+
+    control_period: 0.10           # 제어 주기 [s], 10 Hz — 변경 후 재시작 필요
+    # AMCL은 최소 이동량 전에는 pose를 다시 발행하지 않을 수 있으므로 기본은 0(검사 안 함).
+    pose_timeout: 0.0              # 0보다 크게 설정하면 위치 미갱신 시 정지 [s]
+
+    # House 실습 고정 목적지. 두 배열은 길이가 같아야 함.
+    # 장애물 회피가 없으므로 선분 위에 벽/가구가 없는 좌표만 추가할 것.
+    waypoints_x: [6.27]
+    waypoints_y: [0.56]
+
+    cmd_vel_topic: /cmd_vel
+    pose_topic: /amcl_pose

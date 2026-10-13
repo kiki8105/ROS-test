@@ -1,0 +1,40 @@
+gps_fault_injector:
+  ros__parameters:
+    use_sim_time: true
+    input_topic: /fix/raw
+    output_topic: /fix
+    mode: normal
+    degraded_stddev_m: 5.0
+    random_seed: 64
+
+hybrid_localizer:
+  ros__parameters:
+    use_sim_time: true
+    fix_topic: /fix
+    imu_topic: /imu
+    odom_topic: /odom
+    amcl_topic: /slam_pose
+    camera_topic: /camera/image_raw
+    output_topic: /hybrid_pose
+    frame_id: map
+    datum_latitude: 37.5665
+    datum_longitude: 126.9780
+    map_offset_x: 0.0
+    map_offset_y: 0.0
+    map_yaw_offset: 0.0
+    gps_timeout: 0.8
+    imu_timeout: 0.5
+    # /slam_pose가 이 시간보다 오래되면 마지막 정렬 pose부터 odom/IMU로 전파한다.
+    slam_timeout: 0.8
+    max_gps_stddev_m: 1.0
+    publish_rate: 20.0
+
+slam_pose_relay:
+  ros__parameters:
+    use_sim_time: true
+    map_frame: map
+    base_frame: base_footprint
+    output_topic: /slam_pose
+    health_topic: /slam/healthy
+    publish_rate: 10.0
+    transform_timeout: 0.7

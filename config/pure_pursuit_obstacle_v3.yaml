@@ -1,0 +1,170 @@
+pure_pursuit_obstacle_v3:
+  ros__parameters:
+    use_sim_time: true
+
+    # false이면 /goal_pose로 한 지점씩 실습합니다.
+    # 여러 점 임무는 true로 바꾸고 [x1, y1, x2, y2, ...]로 입력합니다.
+    mission_enabled: false
+    mission_waypoints: [0.0, 0.0]
+
+    # 안전 확인 후에만 true로 변경합니다.
+    drive_enabled: false
+
+    # 코드/YAML WP 임무 실패 시 최초 위치로 한 번 복귀합니다.
+    return_home_on_failure: true
+    return_home_tolerance: 0.20
+    return_home_timeout: 360.0
+
+    # Pure Pursuit 추종과 속도 제한
+    linear_velocity: 0.1
+    lookahead_distance: 0.50
+    minimum_lookahead_distance: 0.05
+    corner_angle_limit: 1.00
+    goal_tolerance: 0.20
+    path_point_tolerance: 0.12
+    # 전체 곡선 주행 상한. 제자리 헤딩 정렬은 아래 0.18rad/s로 더 낮게 제한합니다.
+    max_angular_velocity: 0.35
+    linear_acceleration_limit: 0.15
+    angular_acceleration_limit: 0.80
+    heading_rotate_enter: 1.05
+    heading_rotate_exit: 0.70
+    # 경로 헤딩 오차에 대한 P 게인과 제자리 정렬 전용 상한입니다.
+    # 이전 1.00/0.60 조합은 alpha=0.98rad에서 곧바로 0.60rad/s를 냈습니다.
+    heading_gain: 0.40
+    heading_align_max_angular_velocity: 0.18
+
+    # OccupancyGrid -> 팽창 격자 -> A*
+    occupied_threshold: 50
+    unknown_is_blocked: true
+    inflation_radius: 0.20
+    nearest_free_radius: 0.30
+    allow_diagonal: true
+    max_expansions: 250000
+    replan_distance: 0.45
+    replan_cooldown: 1.0
+
+    # LiDAR와 차체 공간 판정
+    scan_timeout: 0.50
+    odom_timeout: 0.50
+    dynamic_obstacles_enabled: true
+    dynamic_obstacle_ttl: 1.50
+    # 0.60m로 두면 0.40m 지역 회피 구간에 들어오기 전에 hit가 만료될 수 있습니다.
+    # LDS-02의 유효 최소 거리보다 약간 큰 0.20m까지 계속 갱신합니다.
+    dynamic_obstacle_min_range: 0.20
+    dynamic_obstacle_max_range: 2.00
+    # Waffle Pi 차폭과 AMCL 오차를 포함한 동적 장애물 전용 A* 여유 반경입니다.
+    # 정적 벽은 좁은 문 통과를 위해 위 inflation_radius=0.20을 유지합니다.
+    dynamic_inflation_radius: 0.25
+    # SLAM 지도 벽과 실시간 LiDAR 벽은 수십 cm 어긋날 수 있습니다.
+    # 지도 벽 0.50m 이내 hit는 같은 정적 벽으로 간주해 문을 이중 팽창하지 않습니다.
+    # 실제 근접 물체는 이 값과 무관하게 아래 지역 회피가 즉시 정지/우회합니다.
+    dynamic_static_match_radius: 0.50
+    dynamic_replan_cooldown: 0.50
+    pose_timeout: 2.0
+    scan_min_hits: 3
+    front_corridor_half_width: 0.18
+    spin_clearance_radius: 0.23
+    spin_block_confirm_scans: 6
+
+    # 선회 중 차체 반경이 막히면, 방금 회전한 방향을 먼저 되감아
+    # 마지막 전진 자세와 정렬한 다음 저장된 odom 궤적을 후진합니다.
+    unwind_angular_velocity: 0.15
+    unwind_yaw_tolerance: 0.08
+    unwind_timeout: 12.0
+    obs_threshold: 0.40
+
+    # 선회 공간이 막히면 직전 odom 궤적을 제한적으로 역추종합니다.
+    backtrack_distance: 0.50
+    backtrack_min_distance: 0.06
+    backtrack_release_min_distance: 0.10
+    # 아래 반경 여유뿐 아니라 현재 셀이 동적 인플레이션 밖인지도 확인합니다.
+    # 따라서 후진 직후 A* 시작 셀이 같은 장애물 팽창 안에 갇히지 않습니다.
+    backtrack_release_margin: 0.05
+    backtrack_release_confirm_scans: 3
+    backtrack_velocity: 0.03
+    backtrack_lookahead_distance: 0.08
+    backtrack_goal_tolerance: 0.03
+    backtrack_rear_clearance: 0.15
+    backtrack_max_angular_velocity: 0.25
+    backtrack_heading_tolerance: 0.35
+    backtrack_lateral_tolerance: 0.03
+    backtrack_timeout: 24.0
+    forward_trail_spacing: 0.02
+    backtrack_retry_limit: 4
+
+    # 후진으로 선회 반경을 회복해도 같은 A* 직선으로 바로 재진입하지 않습니다.
+    # 원래 선택한 LiDAR 방향이 열려 있으면 그 선회를 먼저 재개합니다.
+    # 원래 방향이 막혔을 때만 반대쪽으로 기울여 짧게 전진한 뒤 원래
+    # 헤딩으로 돌아오는 S 이동을 시도합니다.
+    # 예: 우선회 막힘 -> 후진 -> 우측 재확인; 우측도 막힘 -> 좌측 이동.
+    # 제자리 선회 최소 반경, 반대쪽 LiDAR 통로, 원본 지도, TTL 동적 장애물
+    # 중 하나라도 안전하지 않으면 S 이동은 실행하지 않습니다.
+    # 새 GAP 회복이 기본 경로이므로 좌우 S 이동은 레거시 비상수단으로 끕니다.
+    offset_recovery_enabled: false
+    offset_recovery_turn_angle: 0.50
+    offset_recovery_distance: 0.20
+    offset_recovery_linear_velocity: 0.03
+    offset_recovery_angular_velocity: 0.15
+    offset_recovery_side_clearance: 0.40
+    offset_recovery_front_clearance: 0.15
+    offset_recovery_yaw_tolerance: 0.08
+    offset_recovery_timeout: 20.0
+    offset_recovery_retry_limit: 1
+
+    # 기본 회복: 정지 -> 서로 다른 360도 LiDAR 3회 -> 넓은 통로 헤딩 고정
+    # -> 저속 P 선회 -> 0.18m 진입 -> 같은 목표로 A* 재계획.
+    # 회전 도중 후보를 다시 고르지 않으므로 좌/우 왕복이 생기지 않습니다.
+    gap_recovery_enabled: true
+    gap_scan_count: 3
+    gap_candidate_step: 0.087
+    gap_sector_half_width: 0.26
+    gap_corridor_half_width: 0.20
+    gap_min_clearance: 0.38
+    # 최소 안전거리(위 값)를 넘은 후보 중 A* 헤딩 오차가 가장 작은
+    # 방향을 먼저 고릅니다.  1.40rad(< 90도)는 경로 뒤쪽 전진을 막습니다.
+    gap_max_path_deviation: 1.40
+    gap_heading_weight: 0.50
+    gap_clearance_score_cap: 1.50
+    gap_heading_gain: 0.35
+    gap_max_angular_velocity: 0.15
+    gap_yaw_tolerance: 0.08
+    gap_advance_distance: 0.18
+    gap_advance_velocity: 0.03
+    gap_front_margin: 0.12
+    gap_recovery_timeout: 30.0
+    gap_recovery_retry_limit: 2
+
+    # 레거시 TURN -> BYPASS는 gap_recovery_enabled=false일 때만 사용합니다.
+    avoidance_angular_velocity: 0.16
+    avoidance_linear_velocity: 0.05
+    avoidance_clear_margin: 0.10
+    avoidance_clear_hold_time: 0.80
+    turn_direction_deadband: 0.05
+    minimum_turn_angle: 0.35
+    side_clearance: 0.35
+    side_obstacle_threshold: 0.50
+    wall_follow_gain: 0.80
+    avoidance_min_duration: 1.0
+    avoidance_max_duration: 30.0
+    avoidance_progress_distance: 0.08
+    avoidance_reselect_after_reblocks: 2
+    avoidance_direction_retry_limit: 2
+    rejoin_heading_tolerance: 0.60
+    rejoin_confirm_scans: 3
+
+    # AMCL 표본 사이를 odom으로 보간합니다.
+    odom_anchor_max_age: 0.20
+    odom_reanchor_timeout: 1.0
+    odom_jump_distance: 0.50
+    odom_jump_angle: 1.57
+
+    control_period: 0.10
+
+    map_topic: map
+    pose_topic: amcl_pose
+    odom_topic: odom
+    goal_topic: goal_pose
+    scan_topic: scan
+    cmd_vel_topic: cmd_vel
+    path_topic: planned_path
+    path_alias_topic: plan

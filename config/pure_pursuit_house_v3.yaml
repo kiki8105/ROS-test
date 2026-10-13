@@ -1,0 +1,60 @@
+pure_pursuit_v3_node:
+  ros__parameters:
+    use_sim_time: true
+
+    # Pure Pursuit 기본 주행 — v2에서 사용하던 값을 그대로 유지
+    drive_enabled: false              # Initial Pose와 경로 확인 후 true로 변경
+    lookahead_distance: 0.50          # 전방 주시 거리 [m]: 높일수록 완만한 선회
+    goal_tolerance: 0.20              # 최종 목표 도착 허용 반경 [m]
+    linear_velocity: 0.10             # 정상 경로 추종 속도 [m/s]
+    max_angular_velocity: 1.00        # 모든 회전 명령의 절대 상한 [rad/s]
+    linear_acceleration_limit: 0.15   # 선형 가속·감속 한계 [m/s²]
+    angular_acceleration_limit: 0.80  # 각가속·감속 한계 [rad/s²]
+    control_period: 0.10              # 제어 주기 [s], 10 Hz (재시작 필요)
+    # AMCL 사이를 /odom으로 보간하므로 위치 입력 끊김을 빠르게 감시할 수 있다.
+    pose_timeout: 1.0                 # AMCL과 odom 모두 미갱신 시 정지 [s]
+
+    # House 실습 고정 목적지. x/y 배열 길이는 반드시 같아야 함.
+    waypoints_x: [6.27]
+    waypoints_y: [0.56]
+
+    cmd_vel_topic: /cmd_vel
+    goal_topic: /goal_pose                 # control_64 지도 Goal/HOME 입력
+    global_frame: map                      # Goal 좌표 프레임(변경 후 재시작)
+    pose_topic: /amcl_pose
+    odom_topic: /odom
+    scan_topic: /scan
+
+    # AMCL 절대 위치와 odom 상대이동을 안전하게 결합하는 기준
+    odom_anchor_max_age: 0.20        # AMCL 시각과 odom 표본 허용 차이 [s]
+    odom_reanchor_timeout: 1.00      # odom 중단 후 재수신 시 기준 재설정 시간 [s]
+    odom_jump_distance: 0.50         # 한 표본의 위치 점프를 리셋으로 보는 값 [m]
+    odom_jump_angle: 1.57            # 한 표본의 방향 점프를 리셋으로 보는 값 [rad]
+
+    # LiDAR 상태와 차체 통로 판정
+    scan_timeout: 0.60                # 이 시간 동안 새 scan이 없으면 즉시 정지 [s]
+    scan_min_hits: 3                  # 최소 검출 수: 단일 광선 잡음 무시
+    front_corridor_half_width: 0.18   # 로봇 중심선 좌우 검사 폭의 절반 [m]
+    spin_clearance_radius: 0.27       # 제자리 회전에 필요한 중심 반경 [m]
+
+    # 차체 앞면부터 장애물까지 거리. 항상 emergency < stop < clear < slow.
+    emergency_stop_distance: 0.12     # 충돌 임박 즉시 정지 거리 [m]
+    front_stop_distance: 0.30         # 회피 선회를 시작하는 거리 [m]
+    front_clear_distance: 0.45        # 선회 후 통로가 열렸다고 보는 거리 [m]
+    front_slow_distance: 0.60         # 접근 감속을 시작하는 거리 [m]
+
+    # TURN/BYPASS 회피 상태의 속도와 측면 추종
+    avoidance_linear_velocity: 0.06   # 장애물 옆을 지나는 속도 [m/s]
+    avoidance_angular_velocity: 0.45  # 장애물 앞 선회 속도 [rad/s]
+    minimum_turn_angle: 0.52          # 우회 전 최소 선회각 [rad], 약 30도
+    clear_hold_time: 0.40             # 열린 전방을 연속 확인할 시간 [s]
+    side_clearance: 0.32              # LiDAR에서 장애물 측면까지 목표 거리 [m]
+    wall_follow_gain: 1.20            # 측면 거리 오차 회전 보정 게인
+    obstacle_bias_gain: 0.60          # 정상 주행 중 장애물 반대쪽 보정 게인
+
+    # 목표 경로 복귀와 실패 복구
+    avoidance_min_duration: 1.50      # 너무 일찍 원래 경로로 복귀하지 않는 시간 [s]
+    avoidance_progress_distance: 0.12 # 회피 시작점보다 목표에 가까워질 최소량 [m]
+    rejoin_heading_tolerance: 0.55    # 목표 방향 재진입 허용 오차 [rad]
+    avoidance_max_duration: 20.0      # 진전 없는 한 방향 회피 제한 시간 [s]
+    avoidance_retry_limit: 1          # 시간 초과 시 반대 방향 재시도 횟수

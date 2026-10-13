@@ -1,0 +1,73 @@
+autorace_failover_mission:
+  ros__parameters:
+    use_sim_time: true
+    mission_enabled: false
+
+    # 시험용 센서 고장 override. 실제 토픽 freshness와 별도로 적용된다.
+    simulate_imu_failure: false
+    simulate_vision_failure: false
+    simulate_slam_failure: false
+    simulate_odom_failure: false
+
+    pose_topic: /hybrid_pose
+    odom_topic: /odom
+    imu_topic: /imu
+    scan_topic: /scan
+    cmd_vel_topic: /cmd_vel/mission
+
+    linear_speed: 0.10
+    return_speed: 0.07
+    max_angular_speed: 0.55
+    heading_gain: 1.5
+    vision_gain: 0.25
+    goal_tolerance: 0.14
+    breadcrumb_tolerance: 0.13
+    home_tolerance: 0.20
+    breadcrumb_spacing: 0.10
+
+    gps_loss_hold: 0.5
+    pose_timeout: 0.7
+    odom_timeout: 0.5
+    imu_timeout: 0.5
+    vision_timeout: 0.7
+    slam_timeout: 0.7
+    scan_timeout: 0.7
+
+    brake_min_duration: 0.8
+    brake_hold_time: 0.4
+    brake_speed_threshold: 0.02
+    fallback_acquire_timeout: 5.0
+
+    front_emergency_distance: 0.16
+    front_stop_distance: 0.30
+    front_slow_distance: 0.60
+    avoid_turn_speed: 0.38
+    control_period: 0.10
+
+    # Autorace course.png 중심선을 4x4m 월드 좌표로 환산한 전체 경로.
+    # 공식 spawn (0.8, -1.747)은 노드가 home으로 자동 기록하므로 제외한다.
+    waypoints_x: [
+      1.307, 1.687, 1.758, 1.635, 1.409, 1.094, 0.838, 0.491,
+      0.304, 0.258, 0.427, 0.848, 1.277, 1.586, 1.635, 1.635,
+      1.456, 1.116, 0.893, 0.551, 0.323, -0.093, -0.478, -0.838,
+      -1.201, -1.605, -1.667, -1.324, -0.898, -0.489, -0.246,
+      -0.246, -0.532, -0.945, -1.237, -1.528, -1.746, -1.746
+    ]
+    waypoints_y: [
+      -1.754, -1.656, -1.236, -0.956, -0.984, -0.860, -0.564, -0.564,
+      -0.542, -0.119, 0.224, 0.246, 0.246, 0.435, 0.864, 1.314,
+      1.603, 1.709, 1.500, 1.503, 1.720, 1.754, 1.657, 1.791,
+      1.781, 1.718, 1.406, 1.254, 1.246, 1.196, 0.942, 0.492,
+      0.255, 0.277, 0.490, 0.676, 0.458, 0.008
+    ]
+
+safety_cmd_mux:
+  ros__parameters:
+    use_sim_time: true
+    mission_topic: /cmd_vel/mission
+    manual_topic: /cmd_vel/manual
+    output_topic: /cmd_vel
+    manual_override: false
+    emergency_stop: false
+    command_timeout: 0.5
+    publish_rate: 20.0

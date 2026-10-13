@@ -1,0 +1,16 @@
+red_line_follower:
+  ros__parameters:
+    image_topic: /camera/image_raw
+    cmd_vel_topic: /cmd_vel
+    line_valid_topic: /vision/line_valid
+    linear_speed: 0.08       # 직선 목표 속도 [m/s]; 커브에서는 감속
+    max_angular_speed: 0.65  # 회전 속도 제한 [rad/s]
+    offset_gain: 1.0        # 가까운 선의 좌우 오차에 대한 조향 이득
+    heading_gain: 0.6       # 먼 선과 가까운 선의 방향 차이에 대한 이득
+    max_linear_accel: 0.10  # 정상 추종 중 속도 변화 제한 [m/s²]
+    max_angular_accel: 0.8  # 정상 추종 중 회전 가속도 제한 [rad/s²]
+    image_timeout: 0.6     # 이 시간 동안 영상이 없으면 즉시 0 명령 [실제 초]
+    roi_top: 0.52          # 화면 상단을 제외한 검출 시작 높이 비율
+    roi_bottom: 0.95       # 검출 종료 높이 비율
+    min_area: 80           # 유효한 빨간 영역의 최소 픽셀 수
+    show_debug: false     # 실행 인자로 영상 창 표시 가능

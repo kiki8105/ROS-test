@@ -1,0 +1,26 @@
+pure_pursuit_v3_node:
+  ros__parameters:
+    use_sim_time: true
+    drive_enabled: false
+    pose_topic: /hybrid_pose
+    odom_topic: /odom
+    scan_topic: /scan
+    cmd_vel_topic: /cmd_vel/gps
+    pose_timeout: 1.0
+    scan_timeout: 1.0
+
+    # 빨간 육각 차선의 꼭짓점. GPS 정상 시 선 위를 순서대로 주행한다.
+    waypoints_x: [0.75, -0.75, -1.50, -0.75, 0.75, 1.50]
+    waypoints_y: [1.299, 1.299, 0.0, -1.299, -1.299, 0.0]
+    goal_tolerance: 0.15
+    lookahead_distance: 0.70
+    linear_velocity: 0.12
+    max_angular_velocity: 0.55
+    linear_acceleration_limit: 0.12
+    angular_acceleration_limit: 0.50
+    control_period: 0.10
+
+    front_stop_distance: 0.30
+    front_clear_distance: 0.45
+    front_slow_distance: 0.65
+    emergency_stop_distance: 0.18

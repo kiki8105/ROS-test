@@ -3,7 +3,9 @@ from rclpy.node import Node  # 모듈에서 Node 클래스만 가져옴
 from geometry_msgs.msg import Twist  # 선속도·각속도를 담는 메시지 클래스
 import math
 import time
-
+import json
+from datetime import datetime
+from std_msgs.msg import String
 from sensor_msgs.msg import LaserScan
 from rclpy.qos import qos_profile_sensor_data
 
@@ -40,6 +42,11 @@ class ActionPublisher(Node):
         # self.publish_command: 함수 자체를 전달하여 나중에 실행하도록 등록
         # self.publish_command()처럼 괄호를 붙이면 여기서 즉시 실행됨
         self.timer = self.create_timer(0.1, self.publish_command)
+        self.record_publisher = self.create_publisher(
+            String,
+            '/lidar_record',
+            10,
+        )
 
     # def: 함수를 정의하는 키워드. 클래스 안의 함수는 메서드라고 부름
     def publish_command(self):
@@ -132,6 +139,10 @@ class ActionPublisher(Node):
 
         threshold = 0.6
 
+        received_at = datetime.now().isoformat(
+            sep=' ', timespec='milliseconds'
+        )
+
         if front > threshold:
             self.action = 'forward'
         elif left <= threshold and right <= threshold:
@@ -148,6 +159,30 @@ class ActionPublisher(Node):
             f'전방={front:.2f}, 좌측={left:.2f}, '
             f'우측={right:.2f} → {self.action}'
         )
+
+        # 기록 발행
+        ranges = [
+            float(value)
+            if(
+                math.isfinite(value)
+                and scan.range_min <= value <= scan.range_max
+            )
+            else None
+            for value in scan.ranges
+        ]
+
+        record = {
+            'ranges': ranges,
+            'when': received_at,
+            'action': self.action,
+
+            'angle_min': scan.angle_min,
+            'angle_increment': scan.angle_increment,
+        }
+
+        message = String()
+        message.data = json.dumps(record, allow_nan=False)
+        self.record_publisher.publish(message)
 
 
 # 클래스 밖의 일반 함수
