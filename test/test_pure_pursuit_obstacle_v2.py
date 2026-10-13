@@ -704,12 +704,148 @@ class IntegratedNodeTests(unittest.TestCase):
 
         final = self.node.backtrack_path[-1]
         self.node.odom_callback(make_odom(final[0], final[1], math.pi))
+        for expected_count in (1, 2):
+            self.node.scan_callback(make_scan())
+            self.assertEqual(self.tick(), (0.0, 0.0))
+            self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+            self.assertEqual(
+                self.node.backtrack_release_count, expected_count)
         self.node.scan_callback(make_scan())
         self.assertEqual(self.tick(), (0.0, 0.0))
         self.assertEqual(self.node.avoidance_state, 'TURN')
         self.assertEqual(self.node.plan_count, original_plan_count)
         self.assertEqual(len(self.node.forward_trail), 1)
         self.assertAlmostEqual(self.node.forward_trail[0][0], final[0])
+
+    def test_backtrack_release_requires_margin_and_three_fresh_scans(self):
+        close_scan = self.prepare_backtrack_case()
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+
+        # Move 0.10 m along the frozen reverse trace.  One open scan used to
+        # release BACKTRACK here; it must now start only a confirmation streak.
+        partial = self.node.backtrack_path[2]
+        self.node.odom_callback(make_odom(partial[0], partial[1], math.pi))
+        self.node.scan_callback(make_scan())
+        self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.backtrack_release_count, 1)
+
+        # A new close scan cancels the incomplete release confirmation.
+        self.node.scan_callback(close_scan)
+        self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.backtrack_release_count, 0)
+
+        for expected_count in (1, 2):
+            self.node.scan_callback(make_scan())
+            self.tick()
+            self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+            self.assertEqual(
+                self.node.backtrack_release_count, expected_count)
+        self.node.scan_callback(make_scan())
+        self.tick()
+        self.assertEqual(self.node.avoidance_state, 'TURN')
+
+    def test_early_release_preserves_unused_trace_for_second_backtrack(self):
+        close_scan = self.prepare_backtrack_case()
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+
+        partial = self.node.backtrack_path[2]
+        self.node.odom_callback(make_odom(partial[0], partial[1], math.pi))
+        for _ in range(3):
+            self.node.scan_callback(make_scan())
+            self.tick()
+
+        self.assertEqual(self.node.avoidance_state, 'TURN')
+        self.assertEqual(self.node.backtrack_attempts, 1)
+        self.assertEqual(len(self.node.forward_trail), 1)
+        self.assertGreaterEqual(self.node.backtrack_planned_distance, 0.06)
+        self.assertGreaterEqual(len(self.node.backtrack_path), 2)
+
+        # Re-blocking before any forward motion must resume the unused frozen
+        # trace instead of trying to build a path from one breadcrumb.
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.backtrack_attempts, 2)
+        self.assertGreaterEqual(self.node.backtrack_planned_distance, 0.06)
+
+    def test_forward_motion_discards_retained_backtrack_trace(self):
+        self.node.backtrack_path = [(0.0, 0.0), (-0.10, 0.0)]
+        self.node.backtrack_waypoint_index = 1
+        self.node.backtrack_segment_start = (0.0, 0.0)
+        self.node.avoidance_state = 'BYPASS'
+
+        self.node.publish_motion(0.05, 0.0, 0.1)
+
+        self.assertEqual(self.node.backtrack_path, [])
+        self.assertEqual(self.node.backtrack_waypoint_index, 0)
+
+    def test_path_end_needs_three_low_scans_before_blocking(self):
+        close_scan = self.prepare_backtrack_case()
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        final = self.node.backtrack_path[-1]
+        self.node.odom_callback(make_odom(final[0], final[1], math.pi))
+
+        self.node.scan_callback(close_scan)
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.spin_block_count, 1)
+
+        # Re-evaluating the same scan must not count as another observation.
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.spin_block_count, 1)
+
+        self.node.scan_callback(close_scan)
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.spin_block_count, 2)
+
+        self.node.scan_callback(close_scan)
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BLOCKED')
+
+    def test_short_valid_trace_can_release_after_reaching_its_end(self):
+        close_scan = self.prepare_backtrack_case()
+        # Keep only 0.08 m of straight forward history.  It satisfies the
+        # 0.06 m entry requirement but is shorter than the 0.10 m guard used
+        # only for early release.
+        self.node.forward_trail.clear()
+        self.node.forward_trail.extend([
+            (-0.17, 0.0, math.pi),
+            (-0.19, 0.0, math.pi),
+            (-0.21, 0.0, math.pi),
+            (-0.23, 0.0, math.pi),
+            (-0.25, 0.0, math.pi),
+        ])
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertAlmostEqual(
+            self.node.backtrack_planned_distance, 0.08, delta=0.001)
+
+        final = self.node.backtrack_path[-1]
+        self.node.odom_callback(make_odom(final[0], final[1], math.pi))
+        for expected_count in (1, 2):
+            self.node.scan_callback(make_scan())
+            self.assertEqual(self.tick(), (0.0, 0.0))
+            self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+            self.assertEqual(
+                self.node.backtrack_release_count, expected_count)
+        self.node.scan_callback(make_scan())
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'TURN')
 
     def test_backtrack_stops_if_rear_corridor_becomes_blocked(self):
         close_scan = self.prepare_backtrack_case()

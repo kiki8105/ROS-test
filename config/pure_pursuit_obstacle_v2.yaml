@@ -39,8 +39,11 @@ pure_pursuit_obstacle_v2:
     obs_threshold: 0.40               # 전진 추종 중 차체 앞 회피 시작 거리 [m]
 
     # 선회 공간이 실제로 막혔을 때 직전 /odom 주행 궤적 역추종
-    backtrack_distance: 0.22          # 한 번에 되돌아갈 목표 거리 [m]
+    backtrack_distance: 0.25          # 한 번에 되돌아갈 최대 거리 [m]
     backtrack_min_distance: 0.06      # 재계획 직후에도 쓸 수 있는 최소 직선 궤적 [m]
+    backtrack_release_min_distance: 0.10 # 순간 여유값에 조기 종료하지 않을 최소 후진 [m]
+    backtrack_release_margin: 0.05    # 종료 기준 = spin_clearance_radius + 이 여유 [m]
+    backtrack_release_confirm_scans: 3 # 종료 여유가 연속 3스캔 확인돼야 TURN 복귀
     backtrack_velocity: 0.03          # 저속 후진 속도 절댓값 [m/s]
     backtrack_lookahead_distance: 0.08 # 후진 Pure Pursuit 주시 거리 [m]
     backtrack_goal_tolerance: 0.03    # 후진 breadcrumb 통과 반경 [m]
@@ -48,7 +51,7 @@ pure_pursuit_obstacle_v2:
     backtrack_max_angular_velocity: 0.25 # 후진 중 각속도 상한 [rad/s]
     backtrack_heading_tolerance: 0.35 # 직선 후진 구간에서 허용할 최대 방향 변화 [rad]
     backtrack_lateral_tolerance: 0.03 # 현재 후진 직선에서 허용할 직전 궤적 횡편차 [m]
-    backtrack_timeout: 12.0           # 0.22m 저속 후진+가감속을 포함한 제한 시간 [s]
+    backtrack_timeout: 12.0           # 0.25m 저속 후진+가감속을 포함한 제한 시간 [s]
     forward_trail_spacing: 0.02       # 실제 전진 궤적 저장 간격 [m]
     backtrack_retry_limit: 2          # 같은 장애물 구역에서 최대 2회 후진, 이후 안전 정지
 
