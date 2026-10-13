@@ -33,9 +33,24 @@ pure_pursuit_obstacle_v2:
     scan_timeout: 0.50                # 새 scan이 없으면 정지하는 시간 [s]
     pose_timeout: 2.0                 # AMCL과 odom 모두 끊기면 정지 [s]
     scan_min_hits: 3                  # 단일 광선 잡음을 무시할 최소 검출 수
-    front_corridor_half_width: 0.18   # 전방 검사 통로 반폭 [m]
+    front_corridor_half_width: 0.18   # 전방/후방 차체 통로 검사 반폭 [m]
     spin_clearance_radius: 0.23       # Waffle Pi 외접반경(~0.208m)+약 2cm 선회 여유 [m]
+    spin_block_confirm_scans: 3       # 연속 스캔 3회 확인 후에만 선회 불가 확정
     obs_threshold: 0.40               # 전진 추종 중 차체 앞 회피 시작 거리 [m]
+
+    # 선회 공간이 실제로 막혔을 때 직전 /odom 주행 궤적 역추종
+    backtrack_distance: 0.22          # 한 번에 되돌아갈 목표 거리 [m]
+    backtrack_min_distance: 0.10      # 저장 궤적이 이보다 짧으면 후진하지 않음 [m]
+    backtrack_velocity: 0.03          # 저속 후진 속도 절댓값 [m/s]
+    backtrack_lookahead_distance: 0.08 # 후진 Pure Pursuit 주시 거리 [m]
+    backtrack_goal_tolerance: 0.03    # 후진 breadcrumb 통과 반경 [m]
+    backtrack_rear_clearance: 0.15    # 차체 뒤 끝부터 필요한 최소 장애물 여유 [m]
+    backtrack_max_angular_velocity: 0.25 # 후진 중 각속도 상한 [rad/s]
+    backtrack_heading_tolerance: 0.35 # 직선 후진 구간에서 허용할 최대 방향 변화 [rad]
+    backtrack_lateral_tolerance: 0.03 # 현재 후진 직선에서 허용할 직전 궤적 횡편차 [m]
+    backtrack_timeout: 12.0           # 0.22m 저속 후진+가감속을 포함한 제한 시간 [s]
+    forward_trail_spacing: 0.02       # 실제 전진 궤적 저장 간격 [m]
+    backtrack_retry_limit: 1          # 같은 장애물에서 허용할 후진 횟수
 
     # TURN → BYPASS 장애물 회피
     avoidance_angular_velocity: 0.23  # 장애물 앞 선회 속도 [rad/s]

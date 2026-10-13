@@ -8,14 +8,18 @@ from my_turtle_pkg.pure_pursuit_obstacle_v2 import (
     GridSpec,
     nearest_free_cell,
     occupancy_grid_to_blocked,
+    minimum_radial_clearance,
     propagate_odom_pose,
     pure_pursuit_arc_is_free,
     PurePursuitObstacleV2,
+    rear_body_clearance,
+    reverse_pure_pursuit_command,
     select_collision_free_lookahead,
     select_lookahead_point,
     validate_mission_waypoints,
     WAFFLE_PI_FRONT_X,
     WAFFLE_PI_LIDAR_X,
+    WAFFLE_PI_REAR_X,
     world_to_grid,
 )
 from nav_msgs.msg import OccupancyGrid, Odometry
@@ -177,6 +181,37 @@ class GridAndAStarTests(unittest.TestCase):
         self.assertAlmostEqual(result[0], 2.0, places=6)
         self.assertAlmostEqual(result[1], 4.0, places=6)
         self.assertAlmostEqual(result[2], math.pi / 2.0 + 0.2, places=6)
+
+    def test_radial_clearance_requires_configured_number_of_hits(self):
+        scan = make_scan()
+        paint_sector(scan, 90.0, 0.1, 0.16)
+
+        self.assertLess(minimum_radial_clearance(scan), 0.23)
+        self.assertTrue(math.isinf(
+            minimum_radial_clearance(scan, min_hits=3)))
+
+    def test_rear_clearance_is_measured_from_body_rear_edge(self):
+        scan = make_scan()
+        expected_gap = 0.12
+        raw_range = expected_gap + WAFFLE_PI_LIDAR_X - WAFFLE_PI_REAR_X
+        paint_sector(scan, 180.0, 4.0, raw_range)
+
+        self.assertAlmostEqual(
+            rear_body_clearance(scan, min_hits=3),
+            expected_gap,
+            delta=0.002,
+        )
+
+    def test_reverse_pure_pursuit_uses_reverse_heading_and_correct_sign(self):
+        linear, angular, _ = reverse_pure_pursuit_command(
+            0.0, 0.0, 0.0, -1.0, 0.10, 0.03, 0.25)
+        self.assertLess(linear, 0.0)
+        self.assertLess(angular, 0.0)
+
+        linear, angular, _ = reverse_pure_pursuit_command(
+            0.0, 0.0, 0.0, -1.0, -0.10, 0.03, 0.25)
+        self.assertLess(linear, 0.0)
+        self.assertGreater(angular, 0.0)
 
     def test_predicted_pure_pursuit_arc_detects_blocked_cell(self):
         spec = GridSpec(12, 12, 1.0, -5.0, -5.0, 0.0)
@@ -381,6 +416,25 @@ class IntegratedNodeTests(unittest.TestCase):
         self.assertEqual(self.node.planner_state, 'READY')
         self.assertGreaterEqual(len(self.node.path), 2)
 
+    def prepare_backtrack_case(self):
+        """Prepare a forward odom trail while the robot faces away from goal."""
+        self.node.map_callback(make_map())
+        self.node.odom_callback(make_odom(0.0, 0.0, math.pi))
+        self.node.pose_callback(make_pose(0.0, 0.0, math.pi))
+        self.node.goal_callback(make_goal())
+        self.tick()
+        self.assertEqual(self.node.planner_state, 'READY')
+
+        self.node.current_linear = 0.08
+        for x in (-0.05, -0.10, -0.15, -0.20, -0.25):
+            self.node.odom_callback(make_odom(x, 0.0, math.pi))
+        self.node.current_linear = 0.0
+        self.set_enabled(True)
+
+        scan = make_scan()
+        paint_sector(scan, 90.0, 5.0, 0.16)
+        return scan
+
     def prepare_corner_tracking(self, blocked):
         spec = GridSpec(120, 80, 0.02, -0.5, -0.5, 0.0)
         path = [
@@ -500,6 +554,159 @@ class IntegratedNodeTests(unittest.TestCase):
         _, angular = self.tick()
         self.assertGreater(angular, 0.0)
         self.assertEqual(self.node.turn_direction, 1.0)
+
+    def test_front_obstacle_turn_enters_backtrack_after_three_scans(self):
+        """Exercise the real TRACK -> TURN -> BACKTRACK transition."""
+        self.node.map_callback(make_map())
+        self.node.odom_callback(make_odom(0.0, 0.0, 0.0))
+        self.node.pose_callback(make_pose(0.0, 0.0, 0.0))
+        self.node.goal_callback(make_goal())
+        self.tick()
+
+        self.node.current_linear = 0.08
+        for x in (0.05, 0.10, 0.15, 0.20, 0.25):
+            self.node.odom_callback(make_odom(x, 0.0, 0.0))
+        self.node.current_linear = 0.0
+        self.set_enabled(True)
+
+        close_front = scan_with_front_gap(0.05, left=2.0, right=0.55)
+        for expected_count in (1, 2):
+            self.node.scan_callback(close_front)
+            self.assertEqual(self.tick(), (0.0, 0.0))
+            self.assertEqual(self.node.avoidance_state, 'TURN')
+            self.assertEqual(self.node.spin_block_count, expected_count)
+
+        self.node.scan_callback(close_front)
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertGreaterEqual(self.node.backtrack_planned_distance, 0.20)
+
+    def test_spin_confirmation_restarts_after_skipped_scan_sequence(self):
+        metrics = {'radial': 0.10}
+        now = self.node.get_clock().now()
+
+        self.node.scan_sequence = 10
+        self.assertTrue(self.node.handle_spin_block(metrics, now))
+        self.assertEqual(self.node.spin_block_count, 1)
+
+        # Sequence 11 represents an intervening scan handled by a different
+        # control branch.  Sequence 12 must start a fresh streak.
+        self.node.scan_sequence = 12
+        self.assertTrue(self.node.handle_spin_block(metrics, now))
+        self.assertEqual(self.node.spin_block_count, 1)
+        self.assertEqual(self.node.spin_block_last_scan_sequence, 12)
+
+    def test_forward_motion_clears_spin_confirmation(self):
+        self.node.spin_block_count = 1
+        self.node.spin_block_last_scan_sequence = 7
+
+        self.node.publish_motion(0.05, 0.0, 0.1)
+
+        self.assertEqual(self.node.spin_block_count, 0)
+        self.assertEqual(self.node.spin_block_last_scan_sequence, -1)
+
+    def test_backtrack_path_stops_before_curved_older_trail(self):
+        self.node.latest_odom_pose = (0.0, 0.0, 0.0)
+        self.node.forward_trail.clear()
+        self.node.forward_trail.extend([
+            (-0.20, 0.08, 0.40),
+            (-0.15, 0.05, 0.30),
+            (-0.10, 0.01, 0.05),
+            (-0.05, 0.00, 0.00),
+        ])
+
+        path, distance = self.node._build_backtrack_path()
+
+        self.assertGreaterEqual(distance, 0.10)
+        self.assertLess(distance, 0.15)
+        self.assertEqual(len(path), 3)
+        self.assertAlmostEqual(path[-1][0], -0.10)
+        self.assertAlmostEqual(path[-1][1], 0.0)
+
+    def test_backtrack_rejects_too_short_straight_tail_before_curve(self):
+        self.node.latest_odom_pose = (0.0, 0.0, 0.0)
+        self.node.forward_trail.clear()
+        self.node.forward_trail.extend([
+            (-0.08, 0.04, 0.40),
+            (-0.04, 0.00, 0.00),
+        ])
+
+        path, distance = self.node._build_backtrack_path()
+
+        self.assertEqual(path, [])
+        self.assertAlmostEqual(distance, 0.04)
+
+    def test_single_close_spin_scan_stops_without_permanent_block(self):
+        close_scan = self.prepare_backtrack_case()
+        self.node.scan_callback(close_scan)
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+        self.assertEqual(self.node.spin_block_count, 1)
+
+        self.node.scan_callback(make_scan())
+        _, angular = self.tick()
+        self.assertNotEqual(angular, 0.0)
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+        self.assertEqual(self.node.spin_block_count, 0)
+
+    def test_confirmed_spin_block_backtracks_along_frozen_odom_trail(self):
+        close_scan = self.prepare_backtrack_case()
+        original_plan_count = self.node.plan_count
+        original_waypoint = self.node.current_waypoint_index
+
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            command = self.tick()
+
+        self.assertEqual(command, (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertGreaterEqual(self.node.backtrack_planned_distance, 0.20)
+
+        self.node.scan_callback(close_scan)
+        linear, angular = self.tick()
+        self.assertLess(linear, 0.0)
+        self.assertEqual(angular, 0.0)
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+        self.assertEqual(self.node.plan_count, original_plan_count)
+        self.assertEqual(self.node.current_waypoint_index, original_waypoint)
+
+        final = self.node.backtrack_path[-1]
+        self.node.odom_callback(make_odom(final[0], final[1], math.pi))
+        self.node.scan_callback(make_scan())
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'TURN')
+        self.assertEqual(self.node.plan_count, original_plan_count)
+        self.assertEqual(len(self.node.forward_trail), 1)
+        self.assertAlmostEqual(self.node.forward_trail[0][0], final[0])
+
+    def test_backtrack_stops_if_rear_corridor_becomes_blocked(self):
+        close_scan = self.prepare_backtrack_case()
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+
+        rear_blocked = make_scan()
+        rear_gap = 0.05
+        raw_range = rear_gap + WAFFLE_PI_LIDAR_X - WAFFLE_PI_REAR_X
+        paint_sector(rear_blocked, 180.0, 5.0, raw_range)
+        self.node.scan_callback(rear_blocked)
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BLOCKED')
+
+    def test_backtrack_sensor_timeout_latches_blocked_instead_of_track(self):
+        close_scan = self.prepare_backtrack_case()
+        for _ in range(3):
+            self.node.scan_callback(close_scan)
+            self.tick()
+        self.assertEqual(self.node.avoidance_state, 'BACKTRACK')
+
+        self.node.last_scan_time = (
+            self.node.get_clock().now() - Duration(seconds=2.0))
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'BLOCKED')
 
     def test_heading_alignment_does_not_start_bypass_for_safe_front_gap(self):
         self.node.map_callback(make_map())
@@ -873,10 +1080,14 @@ class IntegratedNodeTests(unittest.TestCase):
         self.tick()
         scan = make_scan()
         paint_sector(scan, 90.0, 5.0, 0.16)
-        self.node.scan_callback(scan)
         self.set_enabled(True)
 
-        self.assertEqual(self.tick(), (0.0, 0.0))
+        # A single close return stops one tick but no longer permanently
+        # latches BLOCKED.  With no odom breadcrumbs, the confirmed third
+        # scan must still fail safe instead of reversing blindly.
+        for _ in range(3):
+            self.node.scan_callback(scan)
+            self.assertEqual(self.tick(), (0.0, 0.0))
         self.assertEqual(self.node.avoidance_state, 'BLOCKED')
 
     def test_non_map_pose_is_rejected_before_map_arrives(self):

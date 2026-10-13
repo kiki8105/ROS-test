@@ -3,7 +3,7 @@
 Pipeline:
     /map + /amcl_pose + code waypoints or /goal_pose
     -> A* -> /plan -> Pure Pursuit
-    /scan -> TRACK / TURN / BYPASS safety controller -> /cmd_vel
+    /scan -> TRACK / TURN / BYPASS / BACKTRACK safety controller -> /cmd_vel
 
 The original pure_pursuit_obstacle.py remains unchanged for comparison.
 """
@@ -39,6 +39,9 @@ WorldPoint = tuple[float, float]
 # turtlebot3_waffle_pi.urdf 기준 base_footprint 좌표 [m].
 WAFFLE_PI_LIDAR_X = -0.064
 WAFFLE_PI_FRONT_X = 0.080
+# URDF collision box rear edge(-0.197m).  The extra 1cm is a conservative
+# margin for the rear casters and model/real-robot differences.
+WAFFLE_PI_REAR_X = -0.207
 
 # ============================================================================
 # 사용자 코드 WP 입력 구역
@@ -114,6 +117,30 @@ def rate_limit(current, target, limit, dt):
     maximum_change = max(0.0, float(limit)) * max(0.0, float(dt))
     delta = max(-maximum_change, min(maximum_change, target - current))
     return current + delta
+
+
+def reverse_pure_pursuit_command(
+        x, y, yaw, target_x, target_y, speed, max_angular):
+    """Return (negative linear, angular, alpha) for a reverse target.
+
+    Reverse steering is computed against yaw + pi.  The positive speed
+    magnitude multiplies curvature; multiplying by the signed negative
+    velocity would invert the steering direction.
+    """
+    delta_x = float(target_x) - float(x)
+    delta_y = float(target_y) - float(y)
+    target_distance = math.hypot(delta_x, delta_y)
+    if target_distance <= 1e-9:
+        return 0.0, 0.0, 0.0
+    reverse_yaw = normalize_angle(float(yaw) + math.pi)
+    alpha = normalize_angle(
+        math.atan2(delta_y, delta_x) - reverse_yaw)
+    curvature = 2.0 * math.sin(alpha) / target_distance
+    speed = max(0.0, float(speed))
+    angular_limit = abs(float(max_angular))
+    if abs(curvature) > 1e-9:
+        speed = min(speed, angular_limit / abs(curvature))
+    return -speed, speed * curvature, alpha
 
 
 def quaternion_yaw(orientation):
@@ -265,12 +292,31 @@ def front_body_clearance(
     return nth_smallest(gaps, max(1, int(min_hits)))
 
 
-def minimum_radial_clearance(scan, lidar_x=WAFFLE_PI_LIDAR_X):
-    """Return the nearest obstacle radius around the robot rotation centre."""
+def rear_body_clearance(
+        scan, half_width=0.18, min_hits=3,
+        lidar_x=WAFFLE_PI_LIDAR_X,
+        body_rear_x=WAFFLE_PI_REAR_X):
+    """Return free distance behind the body inside its reverse corridor."""
     points, _ = scan_points(scan, lidar_x)
-    if not points:
-        return math.inf
-    return min(math.hypot(x, y) for x, y in points)
+    gaps = [
+        max(0.0, body_rear_x - x)
+        for x, y in points
+        # A point beside the body can prevent a spin but does not lie in the
+        # new space swept by a straight reverse.  Only points behind the rear
+        # edge constrain rearward travel.
+        if x < body_rear_x and abs(y) < half_width
+    ]
+    return nth_smallest(gaps, max(1, int(min_hits)))
+
+
+def minimum_radial_clearance(
+        scan, lidar_x=WAFFLE_PI_LIDAR_X, min_hits=1):
+    """Return a noise-resistant obstacle radius around the robot centre."""
+    points, _ = scan_points(scan, lidar_x)
+    return nth_smallest(
+        [math.hypot(x, y) for x, y in points],
+        max(1, int(min_hits)),
+    )
 
 
 def world_to_grid(x, y, spec):
@@ -855,6 +901,7 @@ class PurePursuitObstacleV2(Node):
 
         self.latest_scan = None
         self.last_scan_time = None
+        self.scan_sequence = 0
         self.left_dist = math.inf
         self.front_dist = math.inf
         self.right_dist = math.inf
@@ -870,6 +917,21 @@ class PurePursuitObstacleV2(Node):
         self.avoidance_direction_switches = 0
         self.turn_start_yaw = 0.0
         self.replan_after_avoidance = False
+        self.spin_block_count = 0
+        self.spin_block_last_scan_sequence = -1
+
+        # Separate spatial breadcrumbs are kept in the continuous odom frame.
+        # odom_history above serves AMCL timestamp matching and may fill with
+        # stationary samples, so it is not suitable for exact reverse travel.
+        self.forward_trail = deque(maxlen=1000)
+        self.backtrack_path = []
+        self.backtrack_waypoint_index = 0
+        self.backtrack_segment_start = None
+        self.backtrack_started = None
+        self.backtrack_start_odom = None
+        self.backtrack_planned_distance = 0.0
+        self.backtrack_attempts = 0
+        self.backtrack_trigger_pose = None
 
         self.heading_align_active = False
         self.current_linear = 0.0
@@ -1013,6 +1075,69 @@ class PurePursuitObstacleV2(Node):
             'spin_clearance_radius', 0.23,
             floating_descriptor('제자리 선회에 필요한 차체 중심 반경 [m].', 0.20, 0.60, 0.01))
         self.declare_parameter(
+            'spin_block_confirm_scans', 3,
+            integer_descriptor(
+                '선회 불가를 확정하기 위한 연속 LiDAR 스캔 수.', 1, 10))
+        self.declare_parameter(
+            'backtrack_distance', 0.22,
+            floating_descriptor(
+                '선회 불가 시 직전 실제 궤적을 따라 후진할 거리 [m].',
+                0.08, 0.60, 0.01))
+        self.declare_parameter(
+            'backtrack_min_distance', 0.10,
+            floating_descriptor(
+                'BACKTRACK 진입에 필요한 최소 저장 궤적 길이 [m].',
+                0.05, 0.40, 0.01))
+        self.declare_parameter(
+            'backtrack_velocity', 0.03,
+            floating_descriptor(
+                '직전 궤적 역추종 후진 속도 절댓값 [m/s].',
+                0.01, 0.10, 0.01))
+        self.declare_parameter(
+            'backtrack_lookahead_distance', 0.08,
+            floating_descriptor(
+                '후진 Pure Pursuit 전방 주시 거리 [m].',
+                0.03, 0.30, 0.01))
+        self.declare_parameter(
+            'backtrack_goal_tolerance', 0.03,
+            floating_descriptor(
+                '후진 breadcrumb 통과 허용 반경 [m].',
+                0.01, 0.10, 0.01))
+        self.declare_parameter(
+            'backtrack_rear_clearance', 0.15,
+            floating_descriptor(
+                '차체 뒤 끝부터 필요한 최소 후진 여유 [m].',
+                0.05, 0.50, 0.01))
+        self.declare_parameter(
+            'backtrack_max_angular_velocity', 0.25,
+            floating_descriptor(
+                '후진 궤적 추종 각속도 상한 [rad/s].',
+                0.05, 0.60, 0.01))
+        self.declare_parameter(
+            'backtrack_heading_tolerance', 0.35,
+            floating_descriptor(
+                '직선 후진 구간에서 허용할 최대 방향 변화 [rad].',
+                0.05, 0.80, 0.01))
+        self.declare_parameter(
+            'backtrack_lateral_tolerance', 0.03,
+            floating_descriptor(
+                '제자리 선회가 불가능할 때 직선 후진선에서 허용할 '
+                '직전 궤적의 최대 횡편차 [m].',
+                0.01, 0.15, 0.01))
+        self.declare_parameter(
+            'backtrack_timeout', 12.0,
+            floating_descriptor(
+                '한 번의 후진 복구 제한 시간 [s].', 2.0, 30.0, 0.5))
+        self.declare_parameter(
+            'forward_trail_spacing', 0.02,
+            floating_descriptor(
+                '실제 전진 궤적 breadcrumb 저장 간격 [m].',
+                0.01, 0.10, 0.01))
+        self.declare_parameter(
+            'backtrack_retry_limit', 1,
+            integer_descriptor(
+                '한 장애물에서 허용할 직전 궤적 후진 횟수.', 0, 3))
+        self.declare_parameter(
             'minimum_turn_angle', 0.35,
             floating_descriptor('우회 전 반드시 선회할 최소 각도 [rad].', 0.10, 1.57, 0.01))
         self.declare_parameter(
@@ -1147,6 +1272,17 @@ class PurePursuitObstacleV2(Node):
             'turn_direction_deadband': (0.0, 0.50),
             'front_corridor_half_width': (0.14, 0.50),
             'spin_clearance_radius': (0.20, 0.60),
+            'backtrack_distance': (0.08, 0.60),
+            'backtrack_min_distance': (0.05, 0.40),
+            'backtrack_velocity': (0.01, 0.10),
+            'backtrack_lookahead_distance': (0.03, 0.30),
+            'backtrack_goal_tolerance': (0.01, 0.10),
+            'backtrack_rear_clearance': (0.05, 0.50),
+            'backtrack_max_angular_velocity': (0.05, 0.60),
+            'backtrack_heading_tolerance': (0.05, 0.80),
+            'backtrack_lateral_tolerance': (0.01, 0.15),
+            'backtrack_timeout': (2.0, 30.0),
+            'forward_trail_spacing': (0.01, 0.10),
             'minimum_turn_angle': (0.10, 1.57),
             'side_clearance': (0.15, 1.0),
             'side_obstacle_threshold': (0.20, 1.50),
@@ -1170,6 +1306,10 @@ class PurePursuitObstacleV2(Node):
         }
         values = {name: self.get_parameter(name).value for name in ranges}
         values['scan_min_hits'] = self.get_parameter('scan_min_hits').value
+        values['spin_block_confirm_scans'] = self.get_parameter(
+            'spin_block_confirm_scans').value
+        values['backtrack_retry_limit'] = self.get_parameter(
+            'backtrack_retry_limit').value
         values['avoidance_reselect_after_reblocks'] = self.get_parameter(
             'avoidance_reselect_after_reblocks').value
         values['avoidance_direction_retry_limit'] = self.get_parameter(
@@ -1193,6 +1333,8 @@ class PurePursuitObstacleV2(Node):
                     reason=f'{name} 허용 범위는 {minimum}~{maximum}입니다.')
         for name, minimum, maximum in (
                 ('scan_min_hits', 1, 20),
+                ('spin_block_confirm_scans', 1, 10),
+                ('backtrack_retry_limit', 0, 3),
                 ('avoidance_reselect_after_reblocks', 1, 10),
                 ('avoidance_direction_retry_limit', 0, 5),
                 ('occupied_threshold', 1, 100),
@@ -1221,6 +1363,16 @@ class PurePursuitObstacleV2(Node):
             return SetParametersResult(
                 successful=False,
                 reason='minimum_lookahead_distance는 lookahead_distance 이하여야 합니다.')
+        if float(values['backtrack_min_distance']) > float(
+                values['backtrack_distance']):
+            return SetParametersResult(
+                successful=False,
+                reason='backtrack_min_distance는 backtrack_distance 이하여야 합니다.')
+        if float(values['backtrack_max_angular_velocity']) > float(
+                values['max_angular_velocity']):
+            return SetParametersResult(
+                successful=False,
+                reason='backtrack_max_angular_velocity는 max_angular_velocity 이하여야 합니다.')
         if float(values['avoidance_min_duration']) >= float(
                 values['avoidance_max_duration']):
             return SetParametersResult(
@@ -1255,7 +1407,7 @@ class PurePursuitObstacleV2(Node):
         self.latest_map = message
         self.map_signature = signature
         self.costmap_dirty = True
-        if self.avoidance_state in ('TURN', 'BYPASS'):
+        if self.avoidance_state in ('TURN', 'BYPASS', 'BACKTRACK'):
             self.replan_requested = self.requested_goal is not None
             self.get_logger().info(
                 '회피 중 지도 갱신 수신: TRACK 복귀 후 재계획합니다.')
@@ -1373,6 +1525,29 @@ class PurePursuitObstacleV2(Node):
             return self.latest_odom_pose
         return None
 
+    def _record_forward_trail(self, odom_pose, force=False):
+        """Store spatially separated odom breadcrumbs only while advancing."""
+        if self.avoidance_state == 'BACKTRACK':
+            return
+        if not self.forward_trail:
+            self.forward_trail.append(tuple(odom_pose))
+            return
+        if not force and self.current_linear <= 1e-4:
+            return
+        previous = self.forward_trail[-1]
+        spacing = float(
+            self.get_parameter('forward_trail_spacing').value)
+        if math.hypot(
+                odom_pose[0] - previous[0],
+                odom_pose[1] - previous[1]) >= spacing:
+            self.forward_trail.append(tuple(odom_pose))
+
+    def _reseed_forward_trail(self):
+        """Restart breadcrumbs at the current odom pose after reverse travel."""
+        self.forward_trail.clear()
+        if self.latest_odom_pose is not None:
+            self.forward_trail.append(tuple(self.latest_odom_pose))
+
     def odom_callback(self, message):
         """Continuously propagate the map pose with odometry deltas."""
         position = message.pose.pose.position
@@ -1424,11 +1599,14 @@ class PurePursuitObstacleV2(Node):
 
         if discontinuity_reasons:
             self.odom_history.clear()
+            self.forward_trail.clear()
         if stamp_ns is not None:
             self.odom_history.append((stamp_ns, odom_pose))
         self.latest_odom_pose = odom_pose
         self.latest_odom_stamp_ns = stamp_ns
         self.last_odom_time = now
+        self._record_forward_trail(
+            odom_pose, force=bool(discontinuity_reasons))
 
         if not self.is_localized or self.map_anchor_pose is None:
             return
@@ -1440,6 +1618,10 @@ class PurePursuitObstacleV2(Node):
             self.get_logger().warn(
                 'odom 기준점 재설정: ' + ', '.join(discontinuity_reasons),
                 throttle_duration_sec=1.0)
+            if self.avoidance_state == 'BACKTRACK':
+                self._block_backtrack(
+                    '후진 중 odom 불연속 발생: '
+                    + ', '.join(discontinuity_reasons))
             return
         if self.odom_anchor_pose is None:
             self.odom_anchor_pose = odom_pose
@@ -1458,6 +1640,8 @@ class PurePursuitObstacleV2(Node):
     def _reset_route_for_new_goal(self):
         """Stop and discard state that belongs to the previous A* leg."""
         self.publish_stop()
+        self.backtrack_attempts = 0
+        self.backtrack_trigger_pose = None
         self.path = []
         self.path_cells = []
         self.current_waypoint_index = 0
@@ -1578,6 +1762,7 @@ class PurePursuitObstacleV2(Node):
         """Store the latest scan; validity is checked before motion."""
         self.latest_scan = message
         self.last_scan_time = self.get_clock().now()
+        self.scan_sequence += 1
 
     def scan_metrics(self, alpha):
         """Return angle-aware LiDAR metrics, or None for an invalid scan."""
@@ -1590,6 +1775,10 @@ class PurePursuitObstacleV2(Node):
             'front_right': (math.radians(-45.0), math.radians(25.0), 0.15),
             'left': (math.pi / 2.0, math.radians(30.0), 0.15),
             'right': (-math.pi / 2.0, math.radians(30.0), 0.15),
+            # A rear sector count proves that the sensor actually covers the
+            # reverse direction.  An infinity return still counts as a valid,
+            # open 360-degree LiDAR ray.
+            'rear_range': (math.pi, math.radians(30.0), 0.15),
             'goal': (alpha, math.radians(12.0), 0.05),
         }
         distances = {}
@@ -1605,7 +1794,18 @@ class PurePursuitObstacleV2(Node):
             float(self.get_parameter('front_corridor_half_width').value),
             minimum_hits,
         )
-        distances['radial'] = minimum_radial_clearance(self.latest_scan)
+        distances['rear'] = rear_body_clearance(
+            self.latest_scan,
+            float(self.get_parameter('front_corridor_half_width').value),
+            # Any real rear hit stops reverse motion.  rear_range_count above
+            # separately proves that enough 360-degree rays are present.
+            1,
+        )
+        # Keep thin poles visible.  Temporal confirmation in
+        # handle_spin_block filters a one-scan outlier without ignoring a
+        # persistent one- or two-ray obstacle.
+        distances['radial'] = minimum_radial_clearance(
+            self.latest_scan, min_hits=1)
         return distances
 
     def publish_stop(self, message=None):
@@ -1620,6 +1820,13 @@ class PurePursuitObstacleV2(Node):
             self, desired_linear, desired_angular, dt,
             immediate_linear_stop=False):
         """Apply acceleration and angular limits before publishing."""
+        if (
+                desired_linear > 1e-4
+                and self.avoidance_state != 'BACKTRACK'):
+            # Any actual forward/bypass command breaks a pending sequence of
+            # close spin-clearance observations.  A later turn must earn a
+            # fresh confirmation streak.
+            self._reset_spin_block_confirmation()
         if immediate_linear_stop and desired_linear <= 0.0:
             self.current_linear = 0.0
         else:
@@ -1802,8 +2009,10 @@ class PurePursuitObstacleV2(Node):
 
     def reset_avoidance_state(self, state='TRACK'):
         """Clear state that belongs to a previous obstacle."""
+        if self.avoidance_state == 'BACKTRACK':
+            self._reseed_forward_trail()
         self.avoidance_state = state
-        self.avoidance_active = state in ('TURN', 'BYPASS')
+        self.avoidance_active = state in ('TURN', 'BYPASS', 'BACKTRACK')
         self.turn_direction = 0.0
         self.obstacle_clear_since = None
         self.avoidance_started = None
@@ -1812,12 +2021,25 @@ class PurePursuitObstacleV2(Node):
         self.avoidance_reblock_count = 0
         self.avoidance_direction_switches = 0
         self.turn_start_yaw = self.current_yaw
+        self._reset_spin_block_confirmation()
+        self.backtrack_path = []
+        self.backtrack_waypoint_index = 0
+        self.backtrack_segment_start = None
+        self.backtrack_started = None
+        self.backtrack_start_odom = None
+        self.backtrack_planned_distance = 0.0
+
+    def _reset_spin_block_confirmation(self):
+        """Forget a partial close-scan streak used to authorize reversing."""
+        self.spin_block_count = 0
+        self.spin_block_last_scan_sequence = -1
 
     def set_avoidance_state(self, state, reason):
         """Change local avoidance state and log the transition."""
         if state != self.avoidance_state:
             self.avoidance_state = state
-            self.avoidance_active = state in ('TURN', 'BYPASS')
+            self.avoidance_active = state in (
+                'TURN', 'BYPASS', 'BACKTRACK')
             self.get_logger().info(f'회피 상태 -> {state}: {reason}')
 
     def advance_waypoints(self):
@@ -2056,14 +2278,405 @@ class PurePursuitObstacleV2(Node):
             f'({self.avoidance_direction_switches}/{retry_limit})')
         return True
 
+    def _clear_backtrack_path(self):
+        """Discard one frozen reverse trace without resetting retry count."""
+        self.backtrack_path = []
+        self.backtrack_waypoint_index = 0
+        self.backtrack_segment_start = None
+        self.backtrack_started = None
+        self.backtrack_start_odom = None
+        self.backtrack_planned_distance = 0.0
+
+    def _build_backtrack_path(self):
+        """Freeze a recent, straight odom trail in reverse travel order.
+
+        BACKTRACK starts only because rotating the chassis is unsafe.  Until
+        the radial clearance recovers, the controller therefore commands zero
+        angular velocity.  Keep only breadcrumbs that lie behind the current
+        heading on an approximately straight segment; accepting an older bend
+        here would turn "follow the previous path" into an unverified straight
+        shortcut across the bend.
+        """
+        if self.latest_odom_pose is None:
+            return [], 0.0
+        target_distance = float(
+            self.get_parameter('backtrack_distance').value)
+        minimum_distance = float(
+            self.get_parameter('backtrack_min_distance').value)
+        spacing = float(
+            self.get_parameter('forward_trail_spacing').value)
+        current = (
+            float(self.latest_odom_pose[0]),
+            float(self.latest_odom_pose[1]),
+        )
+        path = [current]
+        accumulated = 0.0
+        previous = current
+        previous_progress = 0.0
+        jump_limit = float(self.get_parameter('odom_jump_distance').value)
+        current_yaw = float(self.latest_odom_pose[2])
+        heading_limit = float(
+            self.get_parameter('backtrack_heading_tolerance').value)
+        lateral_limit = float(
+            self.get_parameter('backtrack_lateral_tolerance').value)
+        forward_x = math.cos(current_yaw)
+        forward_y = math.sin(current_yaw)
+        for pose in reversed(self.forward_trail):
+            step = math.hypot(
+                pose[0] - previous[0], pose[1] - previous[1])
+            if step < max(0.005, 0.50 * spacing):
+                continue
+            if step > jump_limit:
+                return [], 0.0
+            offset_x = float(pose[0]) - current[0]
+            offset_y = float(pose[1]) - current[1]
+            reverse_progress = -(
+                offset_x * forward_x + offset_y * forward_y)
+            lateral_error = abs(
+                -offset_x * forward_y + offset_y * forward_x)
+            heading_error = abs(normalize_angle(
+                float(pose[2]) - current_yaw))
+            if (
+                    reverse_progress <= previous_progress
+                    or lateral_error > lateral_limit
+                    or heading_error > heading_limit):
+                # The usable straight portion ends at the first bend.  A
+                # shorter segment is still valid if it meets the configured
+                # minimum reverse distance.
+                break
+            # Project the accepted breadcrumb onto the verified reverse axis.
+            # This keeps the frozen path identical to the zero-angular-rate
+            # command used while the chassis cannot safely rotate.
+            path.append((
+                current[0] - reverse_progress * forward_x,
+                current[1] - reverse_progress * forward_y,
+            ))
+            accumulated = reverse_progress
+            previous_progress = reverse_progress
+            previous = pose
+            if accumulated >= target_distance:
+                break
+        if accumulated < minimum_distance or len(path) < 2:
+            return [], accumulated
+        return path, accumulated
+
+    def _block_backtrack(self, reason):
+        """Latch a safe stop when reverse recovery cannot continue."""
+        self._reseed_forward_trail()
+        self._clear_backtrack_path()
+        self.set_avoidance_state('BLOCKED', reason)
+        self.publish_stop()
+        self.get_logger().error(reason, throttle_duration_sec=1.0)
+
+    def start_backtrack(self, metrics, now):
+        """Enter bounded reverse Pure Pursuit when rear and odom are safe."""
+        retry_limit = int(
+            self.get_parameter('backtrack_retry_limit').value)
+        if (
+                self.backtrack_attempts >= retry_limit
+                and self.backtrack_trigger_pose is not None):
+            trigger_distance = math.hypot(
+                self.current_x - self.backtrack_trigger_pose[0],
+                self.current_y - self.backtrack_trigger_pose[1],
+            )
+            if trigger_distance >= max(
+                    float(self.get_parameter('replan_distance').value),
+                    float(self.get_parameter('backtrack_distance').value)):
+                self.backtrack_attempts = 0
+                self.backtrack_trigger_pose = None
+        if self.backtrack_attempts >= retry_limit:
+            self._block_backtrack(
+                f'직전 궤적 후진 재시도 한도 {retry_limit}회 초과')
+            return False
+        minimum_hits = int(self.get_parameter('scan_min_hits').value)
+        if metrics.get('rear_range_count', 0) < minimum_hits:
+            self._block_backtrack('후방 LiDAR 범위를 확인할 수 없어 후진하지 않음')
+            return False
+        rear_threshold = float(
+            self.get_parameter('backtrack_rear_clearance').value)
+        if metrics.get('rear', -math.inf) <= rear_threshold:
+            self._block_backtrack(
+                f'후방 여유 부족 '
+                f'({metrics.get("rear", math.nan):.2f}m <= '
+                f'{rear_threshold:.2f}m)')
+            return False
+        if self.latest_odom_pose is None or self.last_odom_time is None:
+            self._block_backtrack('odom이 없어 직전 궤적을 후진할 수 없음')
+            return False
+        odom_age = (now - self.last_odom_time).nanoseconds / 1e9
+        if (
+                not math.isfinite(odom_age)
+                or odom_age < 0.0
+                or odom_age > float(
+                    self.get_parameter('scan_timeout').value)):
+            self._block_backtrack(
+                f'odom이 {odom_age:.2f}s 동안 갱신되지 않아 후진하지 않음')
+            return False
+        path, distance = self._build_backtrack_path()
+        if not path:
+            self._block_backtrack(
+                f'저장된 직전 궤적이 짧아 후진하지 않음 '
+                f'({distance:.2f}m)')
+            return False
+        heading_change = abs(normalize_angle(
+            self.latest_odom_pose[2] - self.forward_trail[-1][2]))
+        heading_limit = float(
+            self.get_parameter('backtrack_heading_tolerance').value)
+        if heading_change > heading_limit:
+            self._block_backtrack(
+                f'마지막 전진 자세에서 {heading_change:.2f}rad 회전해 '
+                f'직선 후진 한도 {heading_limit:.2f}rad 초과')
+            return False
+
+        self.backtrack_attempts += 1
+        if self.backtrack_trigger_pose is None:
+            self.backtrack_trigger_pose = (self.current_x, self.current_y)
+        self.backtrack_path = path
+        self.backtrack_waypoint_index = 1
+        self.backtrack_segment_start = path[0]
+        self.backtrack_started = now
+        self.backtrack_start_odom = tuple(self.latest_odom_pose)
+        self.backtrack_planned_distance = distance
+        self._reset_spin_block_confirmation()
+        self.obstacle_clear_since = None
+        self.set_avoidance_state(
+            'BACKTRACK',
+            f'선회 불가가 연속 확인되어 직전 실제 궤적 '
+            f'{distance:.2f}m 역추종')
+        # A forward command can still be held by the acceleration limiter.
+        # Zero it on entry and allow negative velocity only from the next tick.
+        self.publish_stop()
+        return True
+
+    def handle_spin_block(self, metrics, now):
+        """Stop on a close scan and backtrack only after repeated confirmation."""
+        threshold = float(
+            self.get_parameter('spin_clearance_radius').value)
+        if metrics['radial'] > threshold:
+            self._reset_spin_block_confirmation()
+            return False
+
+        # Even the first close scan stops this tick, but it does not
+        # permanently latch BLOCKED.  Only distinct scan callbacks count.
+        self.publish_stop()
+        if self.scan_sequence != self.spin_block_last_scan_sequence:
+            if (
+                    self.spin_block_last_scan_sequence >= 0
+                    and self.scan_sequence
+                    != self.spin_block_last_scan_sequence + 1):
+                # At least one scan was evaluated by another control branch
+                # (or skipped) between the two close returns.  Do not call
+                # those observations consecutive.
+                self._reset_spin_block_confirmation()
+            self.spin_block_count += 1
+            self.spin_block_last_scan_sequence = self.scan_sequence
+        required = int(
+            self.get_parameter('spin_block_confirm_scans').value)
+        if self.spin_block_count < required:
+            self.get_logger().warn(
+                f'선회 반경 여유 {metrics["radial"]:.3f}m <= '
+                f'{threshold:.3f}m: 새 스캔 확인 '
+                f'{self.spin_block_count}/{required}, 정지 대기',
+                throttle_duration_sec=0.5)
+            return True
+
+        self.get_logger().warn(
+            f'선회 공간 부족이 {required}개 스캔에서 연속 확인됨: '
+            '직전 실제 주행 궤적으로 후진 복구를 시도합니다.')
+        self.start_backtrack(metrics, now)
+        return True
+
+    def _finish_backtrack(self, metrics, now):
+        """Resume the normal TURN/BYPASS flow after reverse clearance."""
+        threshold = float(
+            self.get_parameter('spin_clearance_radius').value)
+        travelled = 0.0
+        if self.backtrack_start_odom is not None and self.latest_odom_pose is not None:
+            travelled = math.hypot(
+                self.latest_odom_pose[0] - self.backtrack_start_odom[0],
+                self.latest_odom_pose[1] - self.backtrack_start_odom[1],
+            )
+        if metrics['radial'] <= threshold:
+            self._block_backtrack(
+                f'{travelled:.2f}m 후진 후에도 선회 공간 미회복 '
+                f'({metrics["radial"]:.3f}m <= {threshold:.3f}m)')
+            return
+
+        try:
+            _, _, alpha = self.path_geometry()
+        except (IndexError, TypeError):
+            alpha = 0.0
+        self.turn_direction = self.select_avoidance_direction(
+            metrics, alpha, previous=self.turn_direction)
+        self.avoidance_started = now
+        self.avoidance_start_pose = (self.current_x, self.current_y)
+        if self.active_goal is not None:
+            self.avoidance_hit_distance = math.hypot(
+                self.active_goal[0] - self.current_x,
+                self.active_goal[1] - self.current_y,
+            )
+        self.turn_start_yaw = self.current_yaw
+        self.obstacle_clear_since = None
+        self.avoidance_reblock_count = 0
+        self._reset_spin_block_confirmation()
+        direction = 'LEFT' if self.turn_direction > 0.0 else 'RIGHT'
+        self._reseed_forward_trail()
+        self._clear_backtrack_path()
+        self.set_avoidance_state(
+            'TURN',
+            f'{travelled:.2f}m 직전 궤적 후진 완료, '
+            f'선회 공간 회복, {direction} 재선택')
+        self.publish_stop()
+
+    def backtrack_command(self, metrics, now, dt):
+        """Follow the frozen odom breadcrumb trail backward with rear checks."""
+        if (
+                self.backtrack_started is None
+                or self.latest_odom_pose is None
+                or not self.backtrack_path):
+            self._block_backtrack('후진 복구 상태 또는 odom 궤적 유실')
+            return
+        elapsed = (now - self.backtrack_started).nanoseconds / 1e9
+        if (
+                not math.isfinite(elapsed)
+                or elapsed < 0.0
+                or elapsed > float(
+                    self.get_parameter('backtrack_timeout').value)):
+            self._block_backtrack(
+                f'직전 궤적 후진 제한 시간 초과 ({elapsed:.1f}s)')
+            return
+        if self.last_odom_time is None:
+            self._block_backtrack('후진 중 odom 수신 중단')
+            return
+        odom_age = (now - self.last_odom_time).nanoseconds / 1e9
+        if (
+                not math.isfinite(odom_age)
+                or odom_age < 0.0
+                or odom_age > float(
+                    self.get_parameter('scan_timeout').value)):
+            self._block_backtrack(
+                f'후진 중 odom 수신 지연 ({odom_age:.2f}s)')
+            return
+        rear_threshold = float(
+            self.get_parameter('backtrack_rear_clearance').value)
+        if metrics.get('rear_range_count', 0) < int(
+                self.get_parameter('scan_min_hits').value):
+            self._block_backtrack('후진 중 후방 LiDAR 범위 유실')
+            return
+        if metrics.get('rear', -math.inf) <= rear_threshold:
+            self._block_backtrack(
+                f'후진 중 후방 장애물 '
+                f'({metrics.get("rear", math.nan):.2f}m <= '
+                f'{rear_threshold:.2f}m)')
+            return
+
+        current_x, current_y, current_yaw = self.latest_odom_pose
+        travelled = math.hypot(
+            current_x - self.backtrack_start_odom[0],
+            current_y - self.backtrack_start_odom[1],
+        )
+        spin_threshold = float(
+            self.get_parameter('spin_clearance_radius').value)
+        if (
+                metrics['radial'] > spin_threshold
+                and travelled >= float(
+                    self.get_parameter('backtrack_min_distance').value)):
+            # Stop as soon as enough room has been recovered.  Continuing to
+            # the maximum trace length only adds reverse exposure.
+            self._finish_backtrack(metrics, now)
+            return
+        tolerance = float(
+            self.get_parameter('backtrack_goal_tolerance').value)
+        while self.backtrack_waypoint_index < len(self.backtrack_path):
+            target = self.backtrack_path[self.backtrack_waypoint_index]
+            distance = math.hypot(
+                target[0] - current_x, target[1] - current_y)
+            start = self.backtrack_segment_start
+            vector_x = target[0] - start[0]
+            vector_y = target[1] - start[1]
+            length_squared = vector_x * vector_x + vector_y * vector_y
+            passed = False
+            if length_squared > 1e-12:
+                passed = (
+                    (current_x - start[0]) * vector_x
+                    + (current_y - start[1]) * vector_y
+                ) / length_squared >= 1.0
+            if distance > tolerance and not passed:
+                break
+            self.backtrack_segment_start = target
+            self.backtrack_waypoint_index += 1
+
+        if self.backtrack_waypoint_index >= len(self.backtrack_path):
+            self._finish_backtrack(metrics, now)
+            return
+
+        target_x, target_y = select_lookahead_point(
+            current_x,
+            current_y,
+            self.backtrack_segment_start,
+            self.backtrack_path,
+            self.backtrack_waypoint_index,
+            float(self.get_parameter(
+                'backtrack_lookahead_distance').value),
+            corner_angle_limit=float(
+                self.get_parameter('minimum_turn_angle').value),
+        )
+        delta_x = target_x - current_x
+        delta_y = target_y - current_y
+        target_distance = math.hypot(delta_x, delta_y)
+        if target_distance <= 1e-6:
+            self.publish_stop()
+            return
+        spin_locked = metrics['radial'] <= spin_threshold
+        if spin_locked:
+            # Rotating is exactly what was declared unsafe.  Back out along
+            # the recent tangent without yaw sweep until radial room returns.
+            desired_linear = -float(
+                self.get_parameter('backtrack_velocity').value)
+            angular = 0.0
+            alpha_reverse = 0.0
+        else:
+            angular_limit = min(
+                float(self.get_parameter(
+                    'backtrack_max_angular_velocity').value),
+                float(self.get_parameter('max_angular_velocity').value),
+            )
+            desired_linear, angular, alpha_reverse = (
+                reverse_pure_pursuit_command(
+                    current_x,
+                    current_y,
+                    current_yaw,
+                    target_x,
+                    target_y,
+                    float(self.get_parameter('backtrack_velocity').value),
+                    angular_limit,
+                )
+            )
+
+        # The frozen trail was physically traversed.  Check the corresponding
+        # reverse arc against the raw static map and use live rear LiDAR for
+        # robot-size/dynamic-obstacle clearance.
+        if not pure_pursuit_arc_is_free(
+                self.raw_blocked if spin_locked else self.blocked,
+                self.grid_spec,
+                self.current_x,
+                self.current_y,
+                normalize_angle(self.current_yaw + math.pi),
+                target_distance,
+                alpha_reverse):
+            self._block_backtrack('직전 후진 원호가 원본 지도 장애물과 겹침')
+            return
+
+        self.publish_motion(desired_linear, angular, dt)
+        self.get_logger().info(
+            f'BACKTRACK {self.backtrack_waypoint_index + 1}/'
+            f'{len(self.backtrack_path)} rear={metrics["rear"]:.2f}m '
+            f'v={self.current_linear:.2f}m/s '
+            f'w={self.current_angular:.2f}rad/s',
+            throttle_duration_sec=1.0)
+
     def start_avoidance(self, metrics, goal_distance, alpha, now):
         """Select a safe initial turn direction when entering avoidance."""
-        if metrics['radial'] <= float(
-                self.get_parameter('spin_clearance_radius').value):
-            self.reset_avoidance_state('BLOCKED')
-            self.get_logger().error(
-                f'제자리 선회 공간 부족 ({metrics["radial"]:.2f}m): 정지합니다.')
-            return False
         self.turn_direction = self.select_avoidance_direction(
             metrics, alpha)
         self.avoidance_started = now
@@ -2148,10 +2761,7 @@ class PurePursuitObstacleV2(Node):
 
     def turn_command(self, metrics, now, dt):
         """Turn in the latched direction until the corridor is clear."""
-        if metrics['radial'] <= float(
-                self.get_parameter('spin_clearance_radius').value):
-            self.set_avoidance_state('BLOCKED', '선회 반경 내 장애물')
-            self.publish_stop()
+        if self.handle_spin_block(metrics, now):
             return
         if self.avoidance_elapsed(now) > float(
                 self.get_parameter('avoidance_max_duration').value):
@@ -2322,7 +2932,7 @@ class PurePursuitObstacleV2(Node):
             dt = period
         self.last_control_time = now
 
-        avoiding = self.avoidance_state in ('TURN', 'BYPASS')
+        avoiding = self.avoidance_state in ('TURN', 'BYPASS', 'BACKTRACK')
         if self.costmap_dirty and not avoiding:
             self.rebuild_costmap()
         if (
@@ -2360,8 +2970,12 @@ class PurePursuitObstacleV2(Node):
                 not math.isfinite(pose_age)
                 or pose_age < 0.0
                 or pose_age > float(self.get_parameter('pose_timeout').value)):
-            self.reset_avoidance_state('WAIT_POSE')
-            self.publish_stop()
+            if self.avoidance_state == 'BACKTRACK':
+                self._block_backtrack(
+                    f'후진 중 위치 갱신 지연 ({pose_age:.1f}s)')
+            else:
+                self.reset_avoidance_state('WAIT_POSE')
+                self.publish_stop()
             self.get_logger().error(
                 f'AMCL 위치가 {pose_age:.1f}s 동안 갱신되지 않아 정지합니다.',
                 throttle_duration_sec=2.0)
@@ -2372,15 +2986,20 @@ class PurePursuitObstacleV2(Node):
                 f'유효한 A* 경로를 기다리는 중입니다 ({self.planner_state}).',
                 throttle_duration_sec=2.0)
             return
-        if self.advance_waypoints():
+        if (
+                self.avoidance_state != 'BACKTRACK'
+                and self.advance_waypoints()):
             self.publish_stop()
             return
 
         goal_distance, target_distance, alpha = self.path_geometry()
 
         if self.latest_scan is None or self.last_scan_time is None:
-            self.reset_avoidance_state('WAIT_SCAN')
-            self.publish_stop()
+            if self.avoidance_state == 'BACKTRACK':
+                self._block_backtrack('후진 중 LiDAR 입력 유실')
+            else:
+                self.reset_avoidance_state('WAIT_SCAN')
+                self.publish_stop()
             self.get_logger().warn(
                 'LiDAR 데이터를 기다리는 중입니다.', throttle_duration_sec=2.0)
             return
@@ -2389,16 +3008,23 @@ class PurePursuitObstacleV2(Node):
                 not math.isfinite(scan_age)
                 or scan_age < 0.0
                 or scan_age > float(self.get_parameter('scan_timeout').value)):
-            self.reset_avoidance_state('WAIT_SCAN')
-            self.publish_stop()
+            if self.avoidance_state == 'BACKTRACK':
+                self._block_backtrack(
+                    f'후진 중 LiDAR 갱신 지연 ({scan_age:.1f}s)')
+            else:
+                self.reset_avoidance_state('WAIT_SCAN')
+                self.publish_stop()
             self.get_logger().error(
                 f'LiDAR가 {scan_age:.1f}s 동안 갱신되지 않아 정지합니다.',
                 throttle_duration_sec=2.0)
             return
         metrics = self.scan_metrics(alpha)
         if metrics is None:
-            self.reset_avoidance_state('WAIT_SCAN')
-            self.publish_stop()
+            if self.avoidance_state == 'BACKTRACK':
+                self._block_backtrack('후진 중 유효한 LiDAR 표본 부족')
+            else:
+                self.reset_avoidance_state('WAIT_SCAN')
+                self.publish_stop()
             self.get_logger().error(
                 '유효한 LiDAR 표본이 부족해 정지합니다.',
                 throttle_duration_sec=2.0)
@@ -2412,6 +3038,9 @@ class PurePursuitObstacleV2(Node):
 
         if self.avoidance_state == 'BLOCKED':
             self.publish_stop()
+            return
+        if self.avoidance_state == 'BACKTRACK':
+            self.backtrack_command(metrics, now, dt)
             return
         if (
                 self.avoidance_state in ('TURN', 'BYPASS')
@@ -2607,17 +3236,7 @@ class PurePursuitObstacleV2(Node):
                 self.get_logger().warn(
                     f'기본 원호가 팽창 장애물과 겹쳐 {recovery_message}',
                     throttle_duration_sec=1.0)
-        if (
-                rotate_only
-                and metrics['radial'] <= float(
-                    self.get_parameter('spin_clearance_radius').value)):
-            threshold = float(
-                self.get_parameter('spin_clearance_radius').value)
-            self.set_avoidance_state(
-                'BLOCKED',
-                f'제자리 정렬 선회 공간 부족 '
-                f'({metrics["radial"]:.3f}m <= {threshold:.3f}m)')
-            self.publish_stop()
+        if rotate_only and self.handle_spin_block(metrics, now):
             return
         self.publish_motion(
             desired_linear,
