@@ -11,6 +11,8 @@ from my_turtle_pkg.pure_pursuit_obstacle_v2 import (
     propagate_odom_pose,
     pure_pursuit_arc_is_free,
     PurePursuitObstacleV2,
+    select_collision_free_lookahead,
+    select_lookahead_point,
     validate_mission_waypoints,
     WAFFLE_PI_FRONT_X,
     WAFFLE_PI_LIDAR_X,
@@ -187,6 +189,99 @@ class GridAndAStarTests(unittest.TestCase):
         self.assertFalse(pure_pursuit_arc_is_free(
             blocked, spec, 0.0, 0.0, 0.0, 2.0, math.pi / 4.0))
 
+    def test_straight_arc_does_not_add_false_diagonal_side_cell(self):
+        spec = GridSpec(240, 240, 1.0, 0.0, 0.0, 0.0)
+        blocked = [False] * (spec.width * spec.height)
+        blocked[189 * spec.width + 190] = True
+        start = grid_to_world(167, 139, spec)
+        target = grid_to_world(191, 193, spec)
+        delta_x = target[0] - start[0]
+        delta_y = target[1] - start[1]
+
+        self.assertTrue(pure_pursuit_arc_is_free(
+            blocked,
+            spec,
+            start[0],
+            start[1],
+            math.atan2(delta_y, delta_x),
+            math.hypot(delta_x, delta_y),
+            0.0,
+        ))
+
+    def test_blocked_corner_arc_selects_shorter_safe_lookahead(self):
+        spec = GridSpec(120, 80, 0.02, -0.5, -0.5, 0.0)
+        blocked = [False] * (spec.width * spec.height)
+        blocked[26 * spec.width + 74] = True
+        path = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (
+                1.0 + 0.5 * math.cos(math.radians(20.0)),
+                0.5 * math.sin(math.radians(20.0)),
+            ),
+        ]
+        x, y, yaw = 0.75, 0.0, 0.0
+        target = select_lookahead_point(
+            x, y, path[0], path, 1, 0.40)
+        distance = math.hypot(target[0] - x, target[1] - y)
+        alpha = math.atan2(target[1] - y, target[0] - x) - yaw
+        self.assertFalse(pure_pursuit_arc_is_free(
+            blocked, spec, x, y, yaw, distance, alpha))
+
+        recovery = select_collision_free_lookahead(
+            blocked,
+            spec,
+            x,
+            y,
+            yaw,
+            path[0],
+            path,
+            1,
+            preferred_distance=0.40,
+            minimum_distance=0.12,
+        )
+
+        self.assertIsNotNone(recovery)
+        recovery_distance, recovery_alpha, used_lookahead = recovery
+        self.assertAlmostEqual(used_lookahead, 0.38)
+        self.assertTrue(pure_pursuit_arc_is_free(
+            blocked,
+            spec,
+            x,
+            y,
+            yaw,
+            recovery_distance,
+            recovery_alpha,
+        ))
+
+    def test_close_saved_corner_is_not_selected_as_recovery_target(self):
+        spec = GridSpec(120, 80, 0.02, -0.5, -0.5, 0.0)
+        blocked = [False] * (spec.width * spec.height)
+        blocked[25 * spec.width + 76] = True
+        path = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (
+                1.0 + 0.5 * math.cos(math.radians(20.0)),
+                0.5 * math.sin(math.radians(20.0)),
+            ),
+        ]
+
+        recovery = select_collision_free_lookahead(
+            blocked,
+            spec,
+            x=0.90,
+            y=0.0,
+            yaw=0.0,
+            segment_start=path[1],
+            path=path,
+            waypoint_index=2,
+            preferred_distance=0.40,
+            minimum_distance=0.12,
+        )
+
+        self.assertIsNone(recovery)
+
 
 class IntegratedNodeTests(unittest.TestCase):
 
@@ -230,6 +325,38 @@ class IntegratedNodeTests(unittest.TestCase):
         self.assertEqual(self.node.planner_state, 'READY')
         self.assertGreaterEqual(len(self.node.path), 2)
 
+    def prepare_corner_tracking(self, blocked):
+        spec = GridSpec(120, 80, 0.02, -0.5, -0.5, 0.0)
+        path = [
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (
+                1.0 + 0.5 * math.cos(math.radians(20.0)),
+                0.5 * math.sin(math.radians(20.0)),
+            ),
+        ]
+        self.node.blocked = blocked
+        self.node.grid_spec = spec
+        self.node.costmap_dirty = False
+        self.node.current_x = 0.75
+        self.node.current_y = 0.0
+        self.node.current_yaw = 0.0
+        self.node.is_localized = True
+        self.node.last_pose_time = self.node.get_clock().now()
+        self.node.requested_goal = path[-1]
+        self.node.active_goal = path[-1]
+        self.node.goal_source = 'EXTERNAL'
+        self.node.path = path
+        self.node.current_waypoint_index = 1
+        self.node.segment_start = path[0]
+        self.node.replan_requested = False
+        self.node.last_plan_time = self.node.get_clock().now()
+        self.node.planner_state = 'READY'
+        self.node.completed = False
+        self.node.mission_active = False
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+
     def test_disabled_node_plans_and_publishes_path_but_stays_stopped(self):
         self.prepare_plan()
 
@@ -239,6 +366,53 @@ class IntegratedNodeTests(unittest.TestCase):
         self.assertAlmostEqual(self.node.path[0][0], 0.0)
         self.assertAlmostEqual(self.node.path[-1][0], 1.5)
 
+    def test_planner_keeps_dense_astar_cells_for_safe_tracking(self):
+        self.prepare_plan()
+
+        self.assertEqual(len(self.node.path), len(self.node.path_cells))
+        self.assertGreater(len(self.node.path_cells), 2)
+        for current_cell, next_cell in zip(
+                self.node.path_cells, self.node.path_cells[1:]):
+            self.assertLessEqual(abs(next_cell[0] - current_cell[0]), 1)
+            self.assertLessEqual(abs(next_cell[1] - current_cell[1]), 1)
+
+    def test_dense_astar_staircase_keeps_metric_lookahead(self):
+        self.node.current_x = 0.0
+        self.node.current_y = 0.0
+        self.node.current_yaw = 0.0
+        self.node.path = [
+            (0.0, 0.0),
+            (0.1, 0.0),
+            (0.2, 0.1),
+            (0.3, 0.1),
+            (0.4, 0.2),
+            (0.5, 0.2),
+        ]
+        self.node.segment_start = self.node.path[0]
+        self.node.current_waypoint_index = 1
+        self.node.active_goal = self.node.path[-1]
+
+        _, target_distance, _ = self.node.path_geometry()
+
+        self.assertGreater(target_distance, 0.30)
+
+    def test_angular_limit_preserves_checked_pure_pursuit_curvature(self):
+        target_distance = 0.05
+        alpha = 0.29
+        expected_curvature = (
+            2.0 * math.sin(alpha) / target_distance)
+
+        linear, angular, rotate_only = self.node.path_command(
+            goal_distance=5.0,
+            target_distance=target_distance,
+            alpha=alpha,
+        )
+
+        self.assertFalse(rotate_only)
+        self.assertLess(linear, 0.08)
+        self.assertLessEqual(abs(angular), 0.60)
+        self.assertAlmostEqual(angular / linear, expected_curvature)
+
     def test_clear_scan_and_enable_publish_forward_cmd_vel(self):
         self.prepare_plan()
         self.node.scan_callback(make_scan())
@@ -247,7 +421,9 @@ class IntegratedNodeTests(unittest.TestCase):
         linear, angular = self.tick()
 
         self.assertGreater(linear, 0.0)
-        self.assertAlmostEqual(angular, 0.0, delta=0.02)
+        # 실제 시작 자세와 첫 A* 셀 중심 사이의 최대 반 셀 오프셋은
+        # 작은 조향 보정을 만들 수 있다.
+        self.assertAlmostEqual(angular, 0.0, delta=0.10)
         self.assertEqual(self.node.avoidance_state, 'TRACK')
 
     def test_front_obstacle_enters_turn_and_latches_direction(self):
@@ -267,6 +443,170 @@ class IntegratedNodeTests(unittest.TestCase):
         _, angular = self.tick()
         self.assertGreater(angular, 0.0)
         self.assertEqual(self.node.turn_direction, 1.0)
+
+    def test_heading_alignment_does_not_start_bypass_for_safe_front_gap(self):
+        self.node.map_callback(make_map())
+        self.node.pose_callback(make_pose(0.0, 0.0, math.pi))
+        self.node.goal_callback(make_goal())
+        self.tick()
+        self.node.scan_callback(
+            scan_with_front_gap(0.36, left=2.0, right=0.55))
+        self.set_enabled(True)
+
+        linear, angular = self.tick()
+
+        self.assertEqual(linear, 0.0)
+        self.assertNotEqual(angular, 0.0)
+        self.assertTrue(self.node.heading_align_active)
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+
+    def test_close_front_aligns_to_an_open_path_ray_before_moving(self):
+        self.prepare_plan()
+        self.node.current_yaw = -0.50
+        self.node.scan_callback(
+            scan_with_front_gap(0.30, left=2.0, right=2.0))
+        self.set_enabled(True)
+
+        linear, angular = self.tick()
+
+        self.assertEqual(linear, 0.0)
+        self.assertGreater(angular, 0.0)
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+
+    def test_bypass_drives_straight_when_the_side_wall_disappears(self):
+        now = self.node.get_clock().now()
+        self.node.avoidance_state = 'BYPASS'
+        self.node.avoidance_started = now
+        self.node.avoidance_start_pose = (0.0, 0.0)
+        self.node.turn_direction = 1.0
+
+        self.node.bypass_command({
+            'front': math.inf,
+            'left': math.inf,
+            'right': math.inf,
+        }, now, 0.1)
+
+        linear, angular = self.twists.commands[-1]
+        self.assertGreater(linear, 0.0)
+        self.assertAlmostEqual(angular, 0.0)
+
+    def test_bypass_only_steers_away_from_a_close_side_wall(self):
+        now = self.node.get_clock().now()
+        self.node.avoidance_state = 'BYPASS'
+        self.node.avoidance_started = now
+        self.node.avoidance_start_pose = (0.0, 0.0)
+        self.node.turn_direction = 1.0
+
+        self.node.bypass_command({
+            'front': math.inf,
+            'left': math.inf,
+            'right': 0.20,
+        }, now, 0.1)
+
+        linear, angular = self.twists.commands[-1]
+        self.assertGreater(linear, 0.0)
+        self.assertGreater(angular, 0.0)
+
+    def test_avoidance_replans_after_displacement_even_if_goal_is_farther(self):
+        self.prepare_plan()
+        self.node.scan_callback(make_scan())
+        self.set_enabled(True)
+        previous_plan_count = self.node.plan_count
+        now = self.node.get_clock().now()
+        self.node.avoidance_state = 'BYPASS'
+        self.node.avoidance_active = True
+        self.node.avoidance_started = now - Duration(seconds=2.0)
+        self.node.avoidance_start_pose = (0.0, 0.0)
+        self.node.avoidance_hit_distance = 1.5
+        self.node.turn_direction = 1.0
+        # Goal x=1.5이므로 x=-0.10은 최종 목표에서 더 멀어진 우회다.
+        self.node.current_x = -0.10
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+        self.assertEqual(self.node.plan_count, previous_plan_count + 1)
+        self.assertAlmostEqual(self.node.path[0][0], -0.10)
+
+    def test_open_planned_direction_can_rejoin_with_close_current_front(self):
+        now = self.node.get_clock().now()
+        self.node.avoidance_started = now - Duration(seconds=2.0)
+        self.node.avoidance_start_pose = (0.0, 0.0)
+        self.node.current_x = 0.10
+
+        self.assertTrue(self.node.can_rejoin({
+            'front': 0.37,
+            'goal': 1.30,
+            'goal_count': 5,
+        }, now))
+
+    def test_second_bypass_reblock_can_reselect_the_open_side(self):
+        now = self.node.get_clock().now()
+        self.node.avoidance_state = 'BYPASS'
+        self.node.avoidance_started = now
+        self.node.avoidance_start_pose = (0.0, 0.0)
+        self.node.turn_direction = -1.0
+        self.node.avoidance_reblock_count = 1
+
+        self.node.bypass_command({
+            'front': 0.30,
+            'front_left': 2.0,
+            'front_right': 0.35,
+            'left': 2.0,
+            'right': 0.35,
+            'radial': 0.50,
+        }, now, 0.1)
+
+        self.assertEqual(self.node.avoidance_state, 'TURN')
+        self.assertEqual(self.node.turn_direction, 1.0)
+        self.assertEqual(self.node.avoidance_direction_switches, 1)
+
+    def test_blocked_corner_arc_uses_shorter_target_and_keeps_moving(self):
+        blocked = [False] * (120 * 80)
+        blocked[26 * 120 + 74] = True
+        self.prepare_corner_tracking(blocked)
+
+        linear, _ = self.tick()
+
+        self.assertGreater(linear, 0.0)
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+
+    def test_no_safe_short_arc_stops_during_replan_cooldown(self):
+        blocked = [True] * (120 * 80)
+        current_cell = (62, 25)
+        blocked[current_cell[1] * 120 + current_cell[0]] = False
+        self.prepare_corner_tracking(blocked)
+
+        self.assertEqual(self.tick(), (0.0, 0.0))
+        self.assertEqual(self.node.avoidance_state, 'TRACK')
+
+    def test_intermediate_corner_is_not_skipped_at_full_tolerance(self):
+        self.node.grid_spec = GridSpec(40, 40, 0.05, -1.0, -1.0, 0.0)
+        self.node.path = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]
+        self.node.segment_start = self.node.path[0]
+        self.node.current_waypoint_index = 1
+        self.node.active_goal = self.node.path[-1]
+        self.node.current_x = 0.90
+        self.node.current_y = 0.0
+
+        self.assertFalse(self.node.advance_waypoints())
+        self.assertEqual(self.node.current_waypoint_index, 1)
+
+        self.node.current_x = 0.98
+        self.assertFalse(self.node.advance_waypoints())
+        self.assertEqual(self.node.current_waypoint_index, 2)
+
+    def test_dense_waypoint_accepts_one_cell_of_cross_track_error(self):
+        self.node.grid_spec = GridSpec(40, 40, 0.05, -1.0, -1.0, 0.0)
+        self.node.path = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)]
+        self.node.segment_start = self.node.path[0]
+        self.node.current_waypoint_index = 1
+        self.node.active_goal = self.node.path[-1]
+        self.node.current_x = -0.058
+        self.node.current_y = 0.99
+
+        self.assertFalse(self.node.advance_waypoints())
+        self.assertEqual(self.node.current_waypoint_index, 2)
 
     def test_replanning_is_suppressed_during_turn(self):
         self.prepare_plan()

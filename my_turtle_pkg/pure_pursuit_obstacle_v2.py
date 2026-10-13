@@ -54,6 +54,13 @@ WAFFLE_PI_FRONT_X = 0.080
 #     (0.0, 0.5),
 # ]
 CODE_MISSION_WAYPOINTS = [
+    (-6.45, -3),
+    (-4.1, 0.95),
+    (-1.18, 4.2),
+    (6.2, -4.4),
+    (6.76, 4.3),
+    (0.91, 1.73),
+    (1.13, -3.5),
 ]
 # ============================================================================
 
@@ -593,6 +600,99 @@ def select_lookahead_point(
     return path[-1]
 
 
+def select_collision_free_lookahead(
+        blocked, spec, x, y, yaw, segment_start, path, waypoint_index,
+        preferred_distance, minimum_distance):
+    """Return the farthest sampled look-ahead whose predicted arc is free.
+
+    A nominal look-ahead can extend just beyond a shallow path corner.  Both
+    A* legs may be free while the chord and Pure Pursuit arc between them cut
+    an inflated obstacle.  Sampling shorter points on the same planned path
+    preserves progress without repeatedly rotating toward an unsafe chord.
+    """
+    if blocked is None or spec is None or not path:
+        return None
+    preferred = max(0.0, float(preferred_distance))
+    if preferred <= 1e-9:
+        return None
+    minimum = min(
+        preferred,
+        max(0.01, float(minimum_distance)),
+    )
+    step = max(0.01, float(spec.resolution))
+
+    def checked_target(
+            target, marker, *, minimum_target_distance=0.0,
+            require_forward=False):
+        delta_x = target[0] - x
+        delta_y = target[1] - y
+        target_distance = math.hypot(delta_x, delta_y)
+        if target_distance < max(1e-6, minimum_target_distance):
+            return None
+        alpha = normalize_angle(math.atan2(delta_y, delta_x) - yaw)
+        if require_forward and math.cos(alpha) <= 0.0:
+            return None
+        if pure_pursuit_arc_is_free(
+                blocked, spec, x, y, yaw, target_distance, alpha):
+            return target_distance, alpha, marker
+        return None
+
+    # 가장 먼 안전 표본부터 검사한다. 원본 A* 셀은 보통 0.05 m 간격이라
+    # 현재 셀을 먼저 고르면 아주 작은 target_distance 때문에 곡률과
+    # 각속도가 불필요하게 포화되고, 열린 다음 코너 대신 이미 지난 셀을
+    # 다시 쫓을 수 있다.
+    distances = []
+    candidate = preferred
+    while candidate > minimum + 1e-9:
+        distances.append(candidate)
+        candidate -= step
+    distances.append(minimum)
+
+    for candidate in distances:
+        target_x, target_y = select_lookahead_point(
+            x,
+            y,
+            segment_start,
+            path,
+            waypoint_index,
+            candidate,
+            corner_angle_limit=math.inf,
+        )
+        delta_x = target_x - x
+        delta_y = target_y - y
+        target_distance = math.hypot(delta_x, delta_y)
+        if target_distance <= 1e-6:
+            continue
+        alpha = normalize_angle(math.atan2(delta_y, delta_x) - yaw)
+        if pure_pursuit_arc_is_free(
+                blocked, spec, x, y, yaw, target_distance, alpha):
+            return target_distance, alpha, candidate
+
+    # 경로 위 거리 표본이 모두 막혔을 때만 원본 셀을 사용한다. 너무
+    # 가깝거나 뒤쪽인 셀은 조향 기준으로 쓰지 않고 호출자가 재계획한다.
+    if 0 <= waypoint_index < len(path):
+        recovery = checked_target(
+            path[waypoint_index],
+            0.0,
+            minimum_target_distance=minimum,
+            require_forward=True,
+        )
+        if recovery is not None:
+            return recovery
+
+    if segment_start is not None:
+        recovery = checked_target(
+            segment_start,
+            -1.0,
+            minimum_target_distance=minimum,
+            require_forward=True,
+        )
+        if recovery is not None:
+            return recovery
+
+    return None
+
+
 def point_to_segment_distance(point, start, end):
     """Return distance from point to a finite line segment."""
     vector_x = end[0] - start[0]
@@ -645,8 +745,10 @@ def pure_pursuit_arc_is_free(
         arc_length = abs((2.0 * alpha) / curvature)
     sample_step = max(0.01, spec.resolution * 0.40)
     sample_count = max(1, int(math.ceil(arc_length / sample_step)))
-    previous_cell = world_to_grid(x, y, spec)
-    if previous_cell is None:
+    start_cell = world_to_grid(x, y, spec)
+    if start_cell is None:
+        return False
+    if blocked[start_cell[1] * spec.width + start_cell[0]]:
         return False
     for index in range(1, sample_count + 1):
         distance = arc_length * index / sample_count
@@ -664,10 +766,13 @@ def pure_pursuit_arc_is_free(
         cell = world_to_grid(world_x, world_y, spec)
         if cell is None:
             return False
-        if not line_is_free(
-                blocked, spec.width, spec.height, previous_cell, cell):
+        # 곡선 위 실제 표본이 들어간 셀만 검사한다. 연속 표본의 셀
+        # 중심을 line_is_free()로 다시 잇는 방식은 실제 원호와 다른
+        # 대각선을 만들어, 원호가 지나지 않은 옆 셀까지 충돌로 판정할
+        # 수 있다. 표본 간격은 셀 크기의 40% 이하라 중간 셀을 건너뛰지
+        # 않으며 로봇 반경은 blocked 맵에 이미 팽창되어 있다.
+        if blocked[cell[1] * spec.width + cell[0]]:
             return False
-        previous_cell = cell
     return True
 
 
@@ -737,7 +842,7 @@ class PurePursuitObstacleV2(Node):
         self.replan_requested = False
 
         # Mission WP index is separate from current_waypoint_index, which is
-        # used for the simplified points inside one A* leg.
+        # used for the dense A* tracking points inside one mission leg.
         self.mission_waypoints = validate_mission_waypoints(
             CODE_MISSION_WAYPOINTS)
         self.mission_waypoint_index = -1
@@ -757,6 +862,9 @@ class PurePursuitObstacleV2(Node):
         self.obstacle_clear_since = None
         self.avoidance_started = None
         self.avoidance_hit_distance = math.inf
+        self.avoidance_start_pose = None
+        self.avoidance_reblock_count = 0
+        self.avoidance_direction_switches = 0
         self.turn_start_yaw = 0.0
         self.replan_after_avoidance = False
 
@@ -851,7 +959,10 @@ class PurePursuitObstacleV2(Node):
             floating_descriptor('장애물 옆 우회 속도 [m/s].', 0.01, 0.15, 0.01))
         self.declare_parameter(
             'obs_threshold', 0.40,
-            floating_descriptor('차체 앞에서 회피를 시작할 거리 [m].', 0.15, 1.5, 0.01))
+            floating_descriptor(
+                '전진 추종 중 차체 앞 회피 시작 거리 [m]. '
+                '제자리 정렬은 spin_clearance_radius를 사용합니다.',
+                0.15, 1.5, 0.01))
         self.declare_parameter(
             'lookahead_distance', 0.40,
             floating_descriptor('경로 위 전방 주시 거리 [m].', 0.10, 2.0, 0.01))
@@ -886,8 +997,8 @@ class PurePursuitObstacleV2(Node):
             'scan_min_hits', 3,
             integer_descriptor('유효 스캔과 장애물에 필요한 최소 광선 수.', 1, 20))
         self.declare_parameter(
-            'spin_clearance_radius', 0.27,
-            floating_descriptor('제자리 선회에 필요한 차체 중심 반경 [m].', 0.24, 0.60, 0.01))
+            'spin_clearance_radius', 0.23,
+            floating_descriptor('제자리 선회에 필요한 차체 중심 반경 [m].', 0.20, 0.60, 0.01))
         self.declare_parameter(
             'minimum_turn_angle', 0.35,
             floating_descriptor('우회 전 반드시 선회할 최소 각도 [rad].', 0.10, 1.57, 0.01))
@@ -905,10 +1016,23 @@ class PurePursuitObstacleV2(Node):
             floating_descriptor('회피 제한 시간 [s]. 초과하면 안전 정지합니다.', 2.0, 120.0, 1.0))
         self.declare_parameter(
             'avoidance_progress_distance', 0.08,
-            floating_descriptor('재진입 전 목표에 가까워질 최소 거리 [m].', 0.0, 1.0, 0.01))
+            floating_descriptor(
+                '재계획 전 회피 시작점에서 이동할 최소 거리 [m].',
+                0.0, 1.0, 0.01))
+        self.declare_parameter(
+            'avoidance_reselect_after_reblocks', 2,
+            integer_descriptor(
+                'BYPASS 재차단이 이 횟수에 도달하면 좌우 공간을 다시 비교합니다.',
+                1, 10))
+        self.declare_parameter(
+            'avoidance_direction_retry_limit', 1,
+            integer_descriptor(
+                '한 회피에서 허용할 반대 방향 재시도 횟수.', 0, 5))
         self.declare_parameter(
             'rejoin_heading_tolerance', 0.60,
-            floating_descriptor('경로 재진입 방향 오차 상한 [rad].', 0.10, 1.50, 0.01))
+            floating_descriptor(
+                '호환용 경로 재진입 방향 오차 [rad]. 현재 위치 A* 재계획에는 사용하지 않습니다.',
+                0.10, 1.50, 0.01))
         self.declare_parameter(
             'heading_rotate_enter', 1.05,
             floating_descriptor('제자리 목표 정렬을 시작할 방향 오차 [rad].', 0.30, 2.80, 0.01))
@@ -1002,7 +1126,7 @@ class PurePursuitObstacleV2(Node):
             'avoidance_clear_hold_time': (0.10, 2.0),
             'turn_direction_deadband': (0.0, 0.50),
             'front_corridor_half_width': (0.14, 0.50),
-            'spin_clearance_radius': (0.24, 0.60),
+            'spin_clearance_radius': (0.20, 0.60),
             'minimum_turn_angle': (0.10, 1.57),
             'side_clearance': (0.15, 1.0),
             'wall_follow_gain': (0.10, 5.0),
@@ -1025,6 +1149,10 @@ class PurePursuitObstacleV2(Node):
         }
         values = {name: self.get_parameter(name).value for name in ranges}
         values['scan_min_hits'] = self.get_parameter('scan_min_hits').value
+        values['avoidance_reselect_after_reblocks'] = self.get_parameter(
+            'avoidance_reselect_after_reblocks').value
+        values['avoidance_direction_retry_limit'] = self.get_parameter(
+            'avoidance_direction_retry_limit').value
         values['occupied_threshold'] = self.get_parameter(
             'occupied_threshold').value
         values['max_expansions'] = self.get_parameter('max_expansions').value
@@ -1044,6 +1172,8 @@ class PurePursuitObstacleV2(Node):
                     reason=f'{name} 허용 범위는 {minimum}~{maximum}입니다.')
         for name, minimum, maximum in (
                 ('scan_min_hits', 1, 20),
+                ('avoidance_reselect_after_reblocks', 1, 10),
+                ('avoidance_direction_retry_limit', 0, 5),
                 ('occupied_threshold', 1, 100),
                 ('max_expansions', 1000, 2000000)):
             try:
@@ -1594,18 +1724,24 @@ class PurePursuitObstacleV2(Node):
         if not cells:
             self.clear_path('A*가 목표까지 연결된 경로를 찾지 못했습니다.')
             return False
+        # A*가 확인한 인접 셀을 그대로 추종한다. 긴 직선으로 단순화하면
+        # 셀 중심끼리의 선분은 안전해도 실제 로봇 자세에서 시작한 선분이나
+        # Pure Pursuit 원호가 코너 안쪽의 팽창 장애물을 자를 수 있다.
+        # 조향은 아래의 look-ahead가 부드럽게 만들므로 경로 자체를 줄일
+        # 필요가 없다. 단순화 결과는 진단용 개수로만 남긴다.
         simplified = simplify_grid_path(
             cells, self.blocked, spec.width, spec.height)
+        tracking_cells = list(cells)
         world_path = [
             grid_to_world(grid_x, grid_y, spec)
-            for grid_x, grid_y in simplified
+            for grid_x, grid_y in tracking_cells
         ]
         if free_start == start_cell:
             world_path[0] = (self.current_x, self.current_y)
         if free_goal == goal_cell:
             world_path[-1] = self.requested_goal
 
-        self.path_cells = simplified
+        self.path_cells = tracking_cells
         self.path = world_path
         self.current_waypoint_index = 1 if len(world_path) > 1 else 0
         self.segment_start = world_path[0]
@@ -1620,8 +1756,8 @@ class PurePursuitObstacleV2(Node):
         self.planner_state = 'READY'
         self.publish_path()
         self.get_logger().info(
-            f'A* 경로 생성({reason}): 원본 {len(cells)}셀 → '
-            f'추종점 {len(world_path)}개, 계획 #{self.plan_count}')
+            f'A* 경로 생성({reason}): 안전 추종점 {len(world_path)}개 '
+            f'(단순화 시 {len(simplified)}개), 계획 #{self.plan_count}')
         if free_goal != goal_cell:
             adjusted_x, adjusted_y = world_path[-1]
             self.get_logger().warn(
@@ -1637,6 +1773,9 @@ class PurePursuitObstacleV2(Node):
         self.obstacle_clear_since = None
         self.avoidance_started = None
         self.avoidance_hit_distance = math.inf
+        self.avoidance_start_pose = None
+        self.avoidance_reblock_count = 0
+        self.avoidance_direction_switches = 0
         self.turn_start_yaw = self.current_yaw
 
     def set_avoidance_state(self, state, reason):
@@ -1652,6 +1791,16 @@ class PurePursuitObstacleV2(Node):
             return False
         tolerance = float(
             self.get_parameter('path_point_tolerance').value)
+        resolution = (
+            self.grid_spec.resolution if self.grid_spec is not None else 0.05)
+        corner_tolerance = min(
+            tolerance,
+            # 0.05 m 간격의 원본 A* 셀에 0.025 m까지 정확히 붙도록
+            # 강제하면 작은 측방 오차에서도 이미 지난 셀을 뒤쫓는다.
+            # 한 셀보다 조금 넓게 인정하되 전체 path_point_tolerance를
+            # 넘지 않게 해 코너를 과도하게 건너뛰지 않는다.
+            max(0.02, 1.25 * float(resolution)),
+        )
         while self.current_waypoint_index < len(self.path) - 1:
             goal = self.path[self.current_waypoint_index]
             distance = math.hypot(
@@ -1666,7 +1815,9 @@ class PurePursuitObstacleV2(Node):
                     + (self.current_y - self.segment_start[1]) * vector_y
                 ) / length_squared
                 passed = progress >= 1.0
-            if distance > tolerance and not passed:
+            reached_corner = distance <= corner_tolerance
+            passed_near_corner = passed and distance <= tolerance
+            if not reached_corner and not passed_near_corner:
                 break
             self.segment_start = goal
             self.current_waypoint_index += 1
@@ -1704,6 +1855,10 @@ class PurePursuitObstacleV2(Node):
             self.path,
             self.current_waypoint_index,
             float(self.get_parameter('lookahead_distance').value),
+            # 원본 A* 셀은 직선/대각선이 번갈아 45도 계단처럼 보인다.
+            # 여기서 매 셀마다 룩어헤드를 끊지 않고 원호 충돌 검사에서
+            # 실제 팽창 장애물과의 안전을 판단한다.
+            corner_angle_limit=math.inf,
         )
         delta_x = target_x - self.current_x
         delta_y = target_y - self.current_y
@@ -1747,11 +1902,17 @@ class PurePursuitObstacleV2(Node):
             0.0 if target_distance <= 1e-6
             else 2.0 * math.sin(alpha) / target_distance
         )
-        return (
-            desired_linear,
-            clamp(desired_linear * curvature, max_angular),
-            False,
-        )
+        desired_angular = desired_linear * curvature
+        if abs(desired_angular) > max_angular and abs(curvature) > 1e-9:
+            # 각속도만 자르면 실제 곡률(w/v)이 충돌 검사에 사용한
+            # Pure Pursuit 원호와 달라진다. 선속도를 함께 낮춰 검사한
+            # 원호와 같은 곡률을 유지한다.
+            desired_linear = min(
+                desired_linear,
+                max_angular / abs(curvature),
+            )
+            desired_angular = desired_linear * curvature
+        return desired_linear, desired_angular, False
 
     def avoidance_elapsed(self, now):
         if self.avoidance_started is None:
@@ -1761,27 +1922,80 @@ class PurePursuitObstacleV2(Node):
             (now - self.avoidance_started).nanoseconds / 1e9,
         )
 
-    def start_avoidance(self, metrics, goal_distance, alpha, now):
-        """Latch one safe turn direction when entering avoidance."""
-        if metrics['radial'] <= float(
-                self.get_parameter('spin_clearance_radius').value):
-            self.reset_avoidance_state('BLOCKED')
-            self.get_logger().error(
-                f'제자리 선회 공간 부족 ({metrics["radial"]:.2f}m): 정지합니다.')
-            return False
+    def avoidance_displacement(self):
+        """Return metric displacement from the start of this avoidance try."""
+        if self.avoidance_start_pose is None:
+            return 0.0
+        return math.hypot(
+            self.current_x - self.avoidance_start_pose[0],
+            self.current_y - self.avoidance_start_pose[1],
+        )
+
+    def select_avoidance_direction(self, metrics, alpha, previous=0.0):
+        """Choose the more open side while retaining a direction on ties."""
         left_score = min(metrics['front_left'], metrics['left'])
         right_score = min(metrics['front_right'], metrics['right'])
         difference = left_score - right_score
         deadband = float(
             self.get_parameter('turn_direction_deadband').value)
         if difference > deadband:
-            self.turn_direction = 1.0
-        elif difference < -deadband:
-            self.turn_direction = -1.0
+            return 1.0
+        if difference < -deadband:
+            return -1.0
+        if abs(previous) > 0.5:
+            return 1.0 if previous > 0.0 else -1.0
+        return 1.0 if alpha >= 0.0 else -1.0
+
+    def switch_avoidance_direction(
+            self, metrics, alpha, now, reason, force_opposite=False):
+        """Start one bounded alternative-direction avoidance attempt."""
+        retry_limit = int(
+            self.get_parameter('avoidance_direction_retry_limit').value)
+        if self.avoidance_direction_switches >= retry_limit:
+            return False
+        previous = self.turn_direction
+        if force_opposite and abs(previous) > 0.5:
+            selected = -previous
         else:
-            self.turn_direction = 1.0 if alpha >= 0.0 else -1.0
+            selected = self.select_avoidance_direction(
+                metrics, alpha, previous=previous)
+            if selected == previous:
+                return False
+        self.turn_direction = selected
+        self.avoidance_direction_switches += 1
+        self.avoidance_started = now
+        self.avoidance_start_pose = (self.current_x, self.current_y)
+        if self.active_goal is not None:
+            self.avoidance_hit_distance = math.hypot(
+                self.active_goal[0] - self.current_x,
+                self.active_goal[1] - self.current_y,
+            )
+        self.turn_start_yaw = self.current_yaw
+        self.obstacle_clear_since = None
+        self.avoidance_reblock_count = 0
+        self.replan_after_avoidance = True
+        direction = 'LEFT' if selected > 0.0 else 'RIGHT'
+        self.set_avoidance_state('TURN', f'{reason}, {direction} 재선택')
+        self.get_logger().warn(
+            f'{reason}: 회피 방향을 {direction}로 변경 '
+            f'({self.avoidance_direction_switches}/{retry_limit})')
+        return True
+
+    def start_avoidance(self, metrics, goal_distance, alpha, now):
+        """Select a safe initial turn direction when entering avoidance."""
+        if metrics['radial'] <= float(
+                self.get_parameter('spin_clearance_radius').value):
+            self.reset_avoidance_state('BLOCKED')
+            self.get_logger().error(
+                f'제자리 선회 공간 부족 ({metrics["radial"]:.2f}m): 정지합니다.')
+            return False
+        self.turn_direction = self.select_avoidance_direction(
+            metrics, alpha)
         self.avoidance_started = now
         self.avoidance_hit_distance = goal_distance
+        self.avoidance_start_pose = (self.current_x, self.current_y)
+        self.avoidance_reblock_count = 0
+        self.avoidance_direction_switches = 0
         self.turn_start_yaw = self.current_yaw
         self.obstacle_clear_since = None
         self.replan_after_avoidance = True
@@ -1799,7 +2013,19 @@ class PurePursuitObstacleV2(Node):
             return
         if self.avoidance_elapsed(now) > float(
                 self.get_parameter('avoidance_max_duration').value):
-            self.set_avoidance_state('BLOCKED', '회피 제한 시간 초과')
+            if self.switch_avoidance_direction(
+                    metrics, 0.0, now, '회피 제한 시간 초과',
+                    force_opposite=True):
+                self.publish_motion(
+                    0.0,
+                    self.turn_direction * float(
+                        self.get_parameter(
+                            'avoidance_angular_velocity').value),
+                    dt,
+                    immediate_linear_stop=True,
+                )
+                return
+            self.set_avoidance_state('BLOCKED', '회피 재시도까지 실패')
             self.publish_stop()
             return
         clear_distance = (
@@ -1837,44 +2063,65 @@ class PurePursuitObstacleV2(Node):
         """Move past an obstacle while maintaining side clearance."""
         if self.avoidance_elapsed(now) > float(
                 self.get_parameter('avoidance_max_duration').value):
-            self.set_avoidance_state('BLOCKED', '우회 제한 시간 초과')
+            if self.switch_avoidance_direction(
+                    metrics, 0.0, now, '우회 제한 시간 초과',
+                    force_opposite=True):
+                self.turn_command(metrics, now, dt)
+                return
+            self.set_avoidance_state('BLOCKED', '우회 재시도까지 실패')
             self.publish_stop()
             return
         if metrics['front'] <= float(
                 self.get_parameter('obs_threshold').value):
+            self.avoidance_reblock_count += 1
+            reselect_after = int(self.get_parameter(
+                'avoidance_reselect_after_reblocks').value)
+            if self.avoidance_reblock_count >= reselect_after:
+                self.switch_avoidance_direction(
+                    metrics,
+                    0.0,
+                    now,
+                    f'우회 중 전방 재차단 {self.avoidance_reblock_count}회',
+                )
             self.turn_start_yaw = self.current_yaw
             self.obstacle_clear_since = None
-            self.set_avoidance_state('TURN', '우회 중 전방 재차단')
+            direction = 'LEFT' if self.turn_direction > 0.0 else 'RIGHT'
+            self.set_avoidance_state(
+                'TURN',
+                f'우회 중 전방 {metrics["front"]:.2f}m 재차단, '
+                f'{direction} 선회')
             self.turn_command(metrics, now, dt)
             return
         side_distance = (
             metrics['right'] if self.turn_direction > 0.0
             else metrics['left'])
         target = float(self.get_parameter('side_clearance').value)
-        bounded_side = min(side_distance, 2.0 * target)
+        # 측면 장애물이 가까울 때만 반대쪽으로 밀어낸다. 장애물이
+        # 멀어졌는데 다시 벽 쪽으로 끌어당기면 열린 전방을 재차단하는
+        # TURN↔BYPASS 진동이 생긴다.
+        clearance_error = max(0.0, target - side_distance)
         angular = (
-            -self.turn_direction
+            self.turn_direction
             * float(self.get_parameter('wall_follow_gain').value)
-            * (bounded_side - target)
+            * clearance_error
+        )
+        angular_limit = min(
+            float(self.get_parameter('max_angular_velocity').value),
+            float(self.get_parameter('avoidance_angular_velocity').value),
         )
         self.publish_motion(
             float(self.get_parameter('avoidance_linear_velocity').value),
-            clamp(
-                angular,
-                float(self.get_parameter('max_angular_velocity').value)),
+            clamp(angular, angular_limit),
             dt,
         )
 
-    def can_rejoin(self, metrics, goal_distance, alpha, now):
-        """Return true after measurable progress and a clear goal ray."""
+    def can_rejoin(self, metrics, now):
+        """Return true after progress when front or planned-path ray is open."""
         if self.avoidance_elapsed(now) < float(
                 self.get_parameter('avoidance_min_duration').value):
             return False
-        if self.avoidance_hit_distance - goal_distance < float(
+        if self.avoidance_displacement() < float(
                 self.get_parameter('avoidance_progress_distance').value):
-            return False
-        if abs(alpha) > float(
-                self.get_parameter('rejoin_heading_tolerance').value):
             return False
         clear_distance = (
             float(self.get_parameter('obs_threshold').value)
@@ -1882,9 +2129,20 @@ class PurePursuitObstacleV2(Node):
         )
         return (
             metrics['front'] > clear_distance
-            and metrics['goal_count'] >= int(
+            or self.goal_ray_is_open(metrics, clear_distance)
+        )
+
+    def goal_ray_is_open(self, metrics, clear_distance=None):
+        """Return whether LiDAR sees enough free range toward the path target."""
+        if clear_distance is None:
+            clear_distance = (
+                float(self.get_parameter('obs_threshold').value)
+                + float(self.get_parameter('avoidance_clear_margin').value)
+            )
+        return (
+            metrics['goal_count'] >= int(
                 self.get_parameter('scan_min_hits').value)
-            and metrics['goal'] > clear_distance
+            and metrics['goal'] > float(clear_distance)
         )
 
     def _maybe_replan_for_deviation(self, now):
@@ -2013,36 +2271,66 @@ class PurePursuitObstacleV2(Node):
         if self.avoidance_state == 'BLOCKED':
             self.publish_stop()
             return
+        if (
+                self.avoidance_state in ('TURN', 'BYPASS')
+                and self.can_rejoin(metrics, now)):
+            displacement = self.avoidance_displacement()
+            open_direction = (
+                '정면'
+                if metrics['front'] > (
+                    float(self.get_parameter('obs_threshold').value)
+                    + float(self.get_parameter(
+                        'avoidance_clear_margin').value))
+                else '계획 경로 방향'
+            )
+            self.reset_avoidance_state()
+            self.replan_after_avoidance = False
+            self.get_logger().info(
+                f'{open_direction} 통로 확보 및 {displacement:.2f}m 이동: '
+                '지나온 회피 경로를 버리고 현재 위치에서 재계획합니다.')
+            self.plan_path('장애물 우회 후 현재 위치')
+            return
         if self.avoidance_state == 'TURN':
             self.turn_command(metrics, now, dt)
             return
         if self.avoidance_state == 'BYPASS':
-            if self.can_rejoin(metrics, goal_distance, alpha, now):
-                self.reset_avoidance_state()
-                if (
-                        self.replan_after_avoidance
-                        or self.replan_requested
-                        or self.costmap_dirty):
-                    self.replan_after_avoidance = False
-                    self.plan_path('장애물 우회 후 현재 위치')
-                    return
-                self.get_logger().info('우회 진전 확인: TRACK 복귀')
-            else:
-                self.bypass_command(metrics, now, dt)
-                return
+            self.bypass_command(metrics, now, dt)
+            return
 
         if self._maybe_replan_for_deviation(now):
             return
-        if metrics['front'] <= float(
-                self.get_parameter('obs_threshold').value):
-            if self.start_avoidance(metrics, goal_distance, alpha, now):
-                self.turn_command(metrics, now, dt)
-            else:
-                self.publish_stop()
-            return
 
+        # 방향 오차가 크면 Pure Pursuit는 먼저 제자리에서 경로 방향을
+        # 맞춘다. 이때 전방 장애물은 회전 후에는 측면/후방이 되므로
+        # TURN/BYPASS 회피를 시작할 이유가 없다. 차체 전체 선회 공간은
+        # 아래의 radial 검사로 별도로 보장한다.
         desired_linear, desired_angular, rotate_only = self.path_command(
             goal_distance, target_distance, alpha)
+        if (
+                not rotate_only
+                and metrics['front'] <= float(
+                    self.get_parameter('obs_threshold').value)):
+            if self.goal_ray_is_open(metrics) and abs(alpha) > 0.10:
+                # 현재 정면은 가깝지만 A* 추종 방향은 열려 있다. 다시
+                # 회피 상태로 들어가지 않고 열린 방향을 먼저 정면으로
+                # 맞춘다. 아래 radial 검사에서 제자리 선회 안전도 확인한다.
+                desired_linear = 0.0
+                desired_angular = clamp(
+                    float(self.get_parameter('heading_gain').value) * alpha,
+                    float(self.get_parameter('max_angular_velocity').value),
+                )
+                rotate_only = True
+                self.get_logger().info(
+                    f'정면 {metrics["front"]:.2f}m, 계획 방향 '
+                    f'{metrics["goal"]:.2f}m: 열린 경로로 제자리 정렬',
+                    throttle_duration_sec=1.0)
+            else:
+                if self.start_avoidance(metrics, goal_distance, alpha, now):
+                    self.turn_command(metrics, now, dt)
+                else:
+                    self.publish_stop()
+                return
+
         if (
                 not rotate_only
                 and not pure_pursuit_arc_is_free(
@@ -2054,22 +2342,95 @@ class PurePursuitObstacleV2(Node):
                     target_distance,
                     alpha,
                 )):
-            # 경로 선분은 자유 공간이어도 Pure Pursuit 원호가 코너 안쪽을
-            # 자를 수 있다. 먼저 목표 방향으로 정렬해 원호를 곧게 만든다.
-            desired_linear = 0.0
-            desired_angular = clamp(
-                float(self.get_parameter('heading_gain').value) * alpha,
-                float(self.get_parameter('max_angular_velocity').value),
+            recovery = select_collision_free_lookahead(
+                self.blocked,
+                self.grid_spec,
+                self.current_x,
+                self.current_y,
+                self.current_yaw,
+                self.segment_start,
+                self.path,
+                self.current_waypoint_index,
+                float(self.get_parameter('lookahead_distance').value),
+                float(self.get_parameter('path_point_tolerance').value),
             )
-            rotate_only = True
-            self.get_logger().warn(
-                '예측 주행 원호가 팽창 장애물과 겹쳐 제자리 정렬합니다.',
-                throttle_duration_sec=1.0)
+            if recovery is None:
+                spin_clearance = float(
+                    self.get_parameter('spin_clearance_radius').value)
+                if (
+                        abs(alpha) > 0.10
+                        and metrics['radial'] > spin_clearance
+                        and self.goal_ray_is_open(metrics)
+                        and pure_pursuit_arc_is_free(
+                            self.blocked,
+                            self.grid_spec,
+                            self.current_x,
+                            self.current_y,
+                            normalize_angle(self.current_yaw + alpha),
+                            target_distance,
+                            0.0,
+                        )):
+                    # 현재 자세에서 전진 원호만 팽창 영역을 자르고,
+                    # 라이다가 계획 방향의 열린 공간을 확인한 코너다.
+                    # 초근접 A* 셀을 뒤쫓지 않고 그 방향을 먼저 바라본다.
+                    desired_linear = 0.0
+                    desired_angular = clamp(
+                        float(self.get_parameter('heading_gain').value)
+                        * alpha,
+                        float(self.get_parameter(
+                            'max_angular_velocity').value),
+                    )
+                    rotate_only = True
+                    self.heading_align_active = False
+                    self.get_logger().warn(
+                        '전진 원호는 팽창 영역과 겹치지만 계획 방향의 '
+                        f'라이다 공간이 {metrics["goal"]:.2f}m 열려 있어 '
+                        '경로 방향으로 먼저 정렬합니다.',
+                        throttle_duration_sec=1.0)
+                else:
+                    cooldown = float(
+                        self.get_parameter('replan_cooldown').value)
+                    since_plan = (
+                        math.inf if self.last_plan_time is None
+                        else (now - self.last_plan_time).nanoseconds / 1e9
+                    )
+                    if since_plan >= cooldown:
+                        self.get_logger().warn(
+                            '안전한 전방 추종 원호가 없어 현재 위치에서 '
+                            'A* 경로를 다시 계산합니다.',
+                            throttle_duration_sec=1.0)
+                        self.plan_path('추종 원호 충돌 후 현재 위치')
+                    else:
+                        self.publish_stop()
+                        self.get_logger().warn(
+                            '안전한 추종 원호를 기다리는 중입니다 '
+                            f'(재계획 대기 {cooldown - since_plan:.1f}s).',
+                            throttle_duration_sec=1.0)
+                    return
+            else:
+                target_distance, alpha, recovery_lookahead = recovery
+                desired_linear, desired_angular, rotate_only = self.path_command(
+                    goal_distance, target_distance, alpha)
+                if recovery_lookahead > 0.0:
+                    recovery_message = (
+                        f'룩어헤드를 {recovery_lookahead:.2f}m로 줄입니다.')
+                elif recovery_lookahead == 0.0:
+                    recovery_message = '현재 A* 경로점을 직접 추종합니다.'
+                else:
+                    recovery_message = '직전 코너 경유점으로 복귀합니다.'
+                self.get_logger().warn(
+                    f'기본 원호가 팽창 장애물과 겹쳐 {recovery_message}',
+                    throttle_duration_sec=1.0)
         if (
                 rotate_only
                 and metrics['radial'] <= float(
                     self.get_parameter('spin_clearance_radius').value)):
-            self.set_avoidance_state('BLOCKED', '제자리 정렬 선회 공간 부족')
+            threshold = float(
+                self.get_parameter('spin_clearance_radius').value)
+            self.set_avoidance_state(
+                'BLOCKED',
+                f'제자리 정렬 선회 공간 부족 '
+                f'({metrics["radial"]:.3f}m <= {threshold:.3f}m)')
             self.publish_stop()
             return
         self.publish_motion(

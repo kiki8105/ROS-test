@@ -32,8 +32,8 @@ pure_pursuit_obstacle_v2:
     pose_timeout: 2.0                 # AMCL과 odom 모두 끊기면 정지 [s]
     scan_min_hits: 3                  # 단일 광선 잡음을 무시할 최소 검출 수
     front_corridor_half_width: 0.18   # 전방 검사 통로 반폭 [m]
-    spin_clearance_radius: 0.27       # 제자리 선회에 필요한 중심 반경 [m]
-    obs_threshold: 0.40               # 차체 앞 회피 시작 거리 [m]
+    spin_clearance_radius: 0.23       # Waffle Pi 외접반경(~0.208m)+약 2cm 선회 여유 [m]
+    obs_threshold: 0.40               # 전진 추종 중 차체 앞 회피 시작 거리 [m]
 
     # TURN → BYPASS 장애물 회피
     avoidance_angular_velocity: 0.23  # 장애물 앞 선회 속도 [rad/s]
@@ -45,9 +45,11 @@ pure_pursuit_obstacle_v2:
     side_clearance: 0.35              # 측면 목표 간격 [m]
     wall_follow_gain: 0.80            # 측면 거리 보정 게인
     avoidance_min_duration: 1.0       # 경로 복귀 전 최소 회피 시간 [s]
-    avoidance_max_duration: 15.0      # 초과 시 BLOCKED 정지 [s]
-    avoidance_progress_distance: 0.08 # 경로 복귀에 필요한 최소 진전 [m]
-    rejoin_heading_tolerance: 0.60    # 경로 복귀 방향 오차 [rad]
+    avoidance_max_duration: 15.0      # 한 방향 회피 제한 시간 [s]
+    avoidance_progress_distance: 0.08 # 회피 시작점에서 실제 이동할 거리 [m]
+    avoidance_reselect_after_reblocks: 2 # 전방 재차단 2회면 좌우 공간 재평가
+    avoidance_direction_retry_limit: 1  # 실패 시 반대 방향 재시도 횟수
+    rejoin_heading_tolerance: 0.60    # 호환용 값, 현재 위치 재계획에는 미사용
 
     # AMCL 절대위치 사이를 /odom 상대이동으로 보간
     odom_anchor_max_age: 0.20         # AMCL-odom 기준 표본 최대 시간차 [s]
